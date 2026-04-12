@@ -1,0 +1,46 @@
+# Public-clean export ignore rules
+# Synced from .ignores so this directory can also function as a standalone git repo.
+
+# OS / editor clutter
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~
+/.idea/
+/.vscode/
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+
+# Python caches and local tooling
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and packaging artifacts
+/.venv/
+/venv/
+/build/
+/dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local agent work artifacts
+/.history/
+/.learnings/
+/failed
+/test.html
+
+# Internal collaboration and runtime traces
+/docs/superpowers/
