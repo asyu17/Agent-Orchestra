@@ -59,28 +59,30 @@
 15. `session-continuity-and-runtime-branching.md`
 16. `full-context-session-memory-and-hydration.md`
 17. `session-domain-and-durable-persistence.md`
-18. `online-collaboration-runtime-migration.md`
-19. `resident-team-collaboration-and-slice-planning.md`
-20. `resident-teammate-online-loop-first-wave.md`
-21. `durable-teammate-loop-and-mailbox-consistency.md`
-22. `leader-loop-teammate-work-surface-boundary-audit.md`
-23. `host-owned-teammate-loop-cutover-audit.md`
-24. `team-parallel-execution-gap.md`
-25. `resident-hierarchical-runtime.md`
-26. `agent-abstraction-skill-and-prompt-system.md`
-27. `execution-guard-failure-patterns.md`
-28. `data-contracts-and-finalization.md`
-29. `worker-lifecycle-protocol-and-lease.md`
-30. `agent-orchestra-gap-handoff.md`
-31. `remaining-work-backlog.md`
-32. `autonomous-runtime.md`
-33. `self-hosting-bootstrap.md`
-34. `claude-team-mapping.md`
-35. `claude-comparison-and-system-logic.md`
-36. `agent-orchestra-framework.md`
-37. `parallel-team-coordination.md`
-38. `architecture.md`
-39. `resident-team-shell-and-attach-first.md`
+18. `resident-daemon-backend-and-session-attach.md`
+19. `online-collaboration-runtime-migration.md`
+20. `resident-team-collaboration-and-slice-planning.md`
+21. `resident-teammate-online-loop-first-wave.md`
+22. `durable-teammate-loop-and-mailbox-consistency.md`
+23. `leader-loop-teammate-work-surface-boundary-audit.md`
+24. `host-owned-teammate-loop-cutover-audit.md`
+25. `team-parallel-execution-gap.md`
+26. `resident-hierarchical-runtime.md`
+27. `agent-abstraction-skill-and-prompt-system.md`
+28. `execution-guard-failure-patterns.md`
+29. `data-contracts-and-finalization.md`
+30. `worker-lifecycle-protocol-and-lease.md`
+31. `runtime-fragility-decomposition-and-hardening-roadmap.md`
+32. `agent-orchestra-gap-handoff.md`
+33. `remaining-work-backlog.md`
+34. `autonomous-runtime.md`
+35. `self-hosting-bootstrap.md`
+36. `claude-team-mapping.md`
+37. `claude-comparison-and-system-logic.md`
+38. `agent-orchestra-framework.md`
+39. `parallel-team-coordination.md`
+40. `architecture.md`
+41. `resident-team-shell-and-attach-first.md`
 
 如果目的是直接把当前系统当作可操作的 session/attach CLI 使用，再补读：
 
@@ -155,6 +157,10 @@
   - 现已补入 first-cut 落地状态：`SessionDomainService` 已进入代码主线，`GroupRuntime` 的 user-visible session methods 与 worker continuity bridge 已经改为统一委托，CLI `session` 默认后端已切到 `postgres`，`SessionContinuityService` 的 `new_session / warm_resume / fork_session` 也已切到 `SessionTransactionStoreCommit`
   - 同时强调 `AgentSession / WorkerSession / ResidentCoordinatorSession / DeliveryState` 仍应保持 runtime-owned truth，而 `HydrationBundle` 继续只作为 continuity read model
   - 适合作为“要彻底重构 session persistence、并避免继续在 CLI/default/in-memory 或 scattered write path 上累积技术债”时的直接入口
+- `resident-daemon-backend-and-session-attach.md`
+  - 固化为什么 AO 的长期正确形态不应继续是前台 bounded orchestration run，而应变成“常驻 daemon backend + thin CLI client + session attach + slot/incarnation supervision”
+  - 明确 daemon 才是 live runtime owner、session 是用户主操作面、异常失败时被替换的是 incarnation 而不是 slot 身份，以及为什么这条线比单纯 watchdog patch 更完整
+  - 适合作为“要把 AO 做成类似 codex/claude 的本地常驻后端，并用 session attach 交互”的直接入口
 - `resident-team-shell-and-attach-first.md`
   - 固化为什么在 continuity first-cut 之后，系统的下一目标不应继续围绕 `exact_wake` 做产品设计，而应把可 attach 的单 team 常驻 shell 提升成默认 operating surface
   - 明确 `attach -> wake -> recover -> warm_resume` 的优先顺序、`ResidentTeamShell` 在 continuity 层与 host-owned runtime truth 之间的位置，以及“先做单 team resident shell、再 lift 到 superleader”的实施顺序
@@ -210,6 +216,10 @@
   - 明确区分 `WorkerExecutionContract` 的执行/verification contract、`WorkerLease` 的活性约束、`WorkerFinalReport` 的终态返回，以及 `VerificationCommandResult.requested_command -> command` 的 fallback 映射
   - 现已补入统一 failure attribution 语义：`backend_cancel_invoked`、`supervisor_timeout_path`、`last_protocol_progress_at`、`last_message_exists_at_failure`、`termination_signal(_name)` 与 `failure_tags`
   - 适合作为“为什么 timeout 不是系统主语义、而只是协议下安全阀”的直接入口
+- `runtime-fragility-decomposition-and-hardening-roadmap.md`
+  - 专门把“AO 为什么看起来经常断”拆成 transport 选型、provider/network/plugin-sync 波动、continuity truth 与 live truth 混淆、以及 resident runtime residual hardening 这 4 层
+  - 明确旧 execution guard 假失败已基本退出主矛盾，真正的根治路线应是 `full resident transport + sticky provider routing + honest run/session finalization + deeper resident reconnect hardening`
+  - 适合作为“要判断当前脆弱性的主因是什么、以及彻底解决时该先改哪一层”的直接入口
 - `current-priority-gap-list.md`
   - 把当前知识层优先级、bootstrap `gap_id`、以及下一轮推荐投喂组合对齐到一张清单上
   - 明确 single-owner session truth 是当前 backlog 主线，bootstrap/self-hosting evidence rewrite 仍是 follow-on
