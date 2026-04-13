@@ -171,6 +171,7 @@ class SessionInspectSnapshot:
     hydration_bundles: tuple[HydrationBundle, ...] = ()
     hydration_summary: tuple[dict[str, object], ...] = ()
     resident_shell_views: tuple[dict[str, object], ...] = ()
+    provider_route_health: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -189,6 +190,7 @@ class SessionInspectSnapshot:
             "hydration_bundles": [bundle.to_dict() for bundle in self.hydration_bundles],
             "hydration_summary": [dict(item) for item in self.hydration_summary],
             "resident_shell_views": [dict(view) for view in self.resident_shell_views],
+            "provider_route_health": [dict(item) for item in self.provider_route_health],
         }
 
 
@@ -600,6 +602,52 @@ class SessionContinuityService:
             hydration_bundles=hydration_bundles,
             hydration_summary=tuple(_hydration_summary(bundle) for bundle in hydration_bundles),
         )
+
+    async def append_session_message(
+        self,
+        *,
+        work_session_id: str,
+        content: str,
+        role: str = "user",
+        scope_kind: str = "session",
+        scope_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> WorkSessionMessage:
+        work_session = await self._require_work_session(work_session_id)
+        now = _now_iso()
+        runtime_generation_id = _optional_string(work_session.current_runtime_generation_id)
+        work_session.updated_at = now
+        message = WorkSessionMessage(
+            work_session_id=work_session_id,
+            runtime_generation_id=runtime_generation_id,
+            role=(role or "user").strip() or "user",
+            scope_kind=(scope_kind or "session").strip() or "session",
+            scope_id=_optional_string(scope_id),
+            content=str(content),
+            content_kind="text",
+            created_at=now,
+            metadata={str(key): value for key, value in (metadata or {}).items()},
+        )
+        event = SessionEvent(
+            work_session_id=work_session_id,
+            runtime_generation_id=runtime_generation_id,
+            event_kind="work_session_message_appended",
+            payload={
+                "message_id": message.message_id,
+                "role": message.role,
+                "scope_kind": message.scope_kind,
+                "scope_id": message.scope_id,
+            },
+            created_at=now,
+        )
+        await self.store.commit_session_transaction(
+            SessionTransactionStoreCommit(
+                work_sessions=(work_session,),
+                work_session_messages=(message,),
+                session_events=(event,),
+            )
+        )
+        return message
 
     async def resume_gate(self, work_session_id: str) -> ResumeGateDecision:
         work_session = await self.store.get_work_session(work_session_id)

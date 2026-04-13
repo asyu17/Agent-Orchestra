@@ -27,6 +27,18 @@ from agent_orchestra.contracts.blackboard import BlackboardEntry, BlackboardSnap
 from agent_orchestra.contracts.agent import AgentSession
 from agent_orchestra.contracts.authority import AuthorityDecision, ScopeExtensionRequest
 from agent_orchestra.contracts.delivery import DeliveryState, DeliveryStateKind, DeliveryStatus
+from agent_orchestra.contracts.daemon import (
+    AgentIncarnation,
+    AgentIncarnationStatus,
+    AgentSlot,
+    AgentSlotStatus,
+    ProviderRouteHealth,
+    ProviderRouteStatus,
+    SessionAttachment,
+    SessionAttachmentStatus,
+    SlotFailureClass,
+    SlotHealthEvent,
+)
 from agent_orchestra.contracts.enums import BlackboardEntryKind, BlackboardKind, TaskScope, TaskStatus, WorkerStatus
 from agent_orchestra.contracts.execution import (
     WorkerHandle,
@@ -364,6 +376,21 @@ class PostgresOrchestrationStoreTest(IsolatedAsyncioTestCase):
         self.assertIn("last_progress_at TEXT NOT NULL", schema_sql)
         self.assertIn("payload JSONB NOT NULL", schema_sql)
 
+    async def test_postgres_schema_includes_daemon_slot_tables(self) -> None:
+        store = PostgresOrchestrationStore("postgresql://unused")
+        schema_sql = "\n".join(store.get_schema_statements())
+
+        self.assertIn("CREATE TABLE IF NOT EXISTS agent_orchestra.agent_slots", schema_sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS agent_orchestra.agent_incarnations", schema_sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS agent_orchestra.slot_health_events", schema_sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS agent_orchestra.session_attachments", schema_sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS agent_orchestra.provider_route_health", schema_sql)
+        self.assertIn("slot_id TEXT PRIMARY KEY", schema_sql)
+        self.assertIn("incarnation_id TEXT PRIMARY KEY", schema_sql)
+        self.assertIn("event_id TEXT PRIMARY KEY", schema_sql)
+        self.assertIn("attachment_id TEXT PRIMARY KEY", schema_sql)
+        self.assertIn("route_key TEXT PRIMARY KEY", schema_sql)
+
     async def test_postgres_store_round_trips_planning_review_artifacts(self) -> None:
         connection = _FakeAsyncConnection()
         store = PostgresOrchestrationStore(
@@ -475,6 +502,144 @@ class PostgresOrchestrationStoreTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(loaded_revised), 1)
         self.assertEqual(loaded_revised[0].leader_id, "leader:runtime")
         self.assertEqual(loaded_revised[0].revision_bundle_ref, "bundle:runtime:round-1")
+
+    async def test_postgres_store_persists_daemon_slot_entities(self) -> None:
+        connection = _FakeAsyncConnection()
+        store = PostgresOrchestrationStore(
+            "postgresql://unused",
+            connection_factory=lambda: connection,
+        )
+        await self._save_work_session(
+            store,
+            work_session_id="worksession_daemon",
+            objective_id="obj-daemon",
+            runtime_generation_id="runtimegen_daemon",
+        )
+        await self._save_runtime_generation(
+            store,
+            runtime_generation_id="runtimegen_daemon",
+            work_session_id="worksession_daemon",
+            objective_id="obj-daemon",
+        )
+
+        slot = AgentSlot(
+            slot_id="leader:lane:runtime",
+            role="leader",
+            work_session_id="worksession_daemon",
+            resident_team_shell_id="shell-daemon",
+            status=AgentSlotStatus.ACTIVE,
+            desired_state="active",
+            preferred_backend="tmux",
+            preferred_transport_class="full_resident_transport",
+            current_incarnation_id="inc-daemon",
+            current_lease_id="lease-daemon",
+            restart_count=1,
+            created_at="2026-04-12T10:00:00+00:00",
+            updated_at="2026-04-12T10:00:01+00:00",
+        )
+        incarnation = AgentIncarnation(
+            incarnation_id="inc-daemon",
+            slot_id=slot.slot_id,
+            work_session_id=slot.work_session_id,
+            runtime_generation_id="runtimegen_daemon",
+            status=AgentIncarnationStatus.ACTIVE,
+            backend="tmux",
+            transport_locator={"session_name": "ao-runtime"},
+            lease_id="lease-daemon",
+            restart_generation=1,
+            started_at="2026-04-12T10:00:02+00:00",
+        )
+        health_event = SlotHealthEvent(
+            event_id="slotevt-daemon",
+            slot_id=slot.slot_id,
+            incarnation_id=incarnation.incarnation_id,
+            work_session_id=slot.work_session_id,
+            event_kind="heartbeat",
+            failure_class=None,
+            observed_at="2026-04-12T10:00:03+00:00",
+            detail="ok",
+        )
+        attachment = SessionAttachment(
+            attachment_id="attach-daemon",
+            work_session_id=slot.work_session_id,
+            resident_team_shell_id="shell-daemon",
+            slot_id=slot.slot_id,
+            incarnation_id=incarnation.incarnation_id,
+            client_id="cli-1",
+            status=SessionAttachmentStatus.ATTACHED,
+            attached_at="2026-04-12T10:00:04+00:00",
+            detached_at=None,
+            last_event_id="evt-1",
+        )
+        route = ProviderRouteHealth(
+            route_key="leader/openai/gpt-5",
+            role="leader",
+            backend="openai",
+            route_fingerprint="model:gpt-5",
+            status=ProviderRouteStatus.HEALTHY,
+            health_score=0.9,
+            consecutive_failures=0,
+            last_failure_class=None,
+            cooldown_expires_at=None,
+            preferred=True,
+            updated_at="2026-04-12T10:00:05+00:00",
+        )
+
+        await store.save_agent_slot(slot)
+        await store.save_agent_incarnation(incarnation)
+        await store.append_slot_health_event(health_event)
+        await store.save_session_attachment(attachment)
+        await store.save_provider_route_health(route)
+
+        loaded_slot = await store.get_agent_slot(slot.slot_id)
+        loaded_incarnation = await store.get_agent_incarnation(incarnation.incarnation_id)
+        loaded_route = await store.get_provider_route_health(route.route_key)
+        self.assertEqual(loaded_slot, slot)
+        self.assertEqual(loaded_incarnation, incarnation)
+        self.assertEqual(loaded_route, route)
+        self.assertEqual(
+            [item.slot_id for item in await store.list_agent_slots(work_session_id=slot.work_session_id)],
+            [slot.slot_id],
+        )
+        self.assertEqual(
+            [item.incarnation_id for item in await store.list_agent_incarnations(slot_id=slot.slot_id)],
+            [incarnation.incarnation_id],
+        )
+        self.assertEqual(
+            [item.event_id for item in await store.list_slot_health_events(slot_id=slot.slot_id)],
+            [health_event.event_id],
+        )
+        self.assertEqual(
+            [item.attachment_id for item in await store.list_session_attachments(slot.work_session_id)],
+            [attachment.attachment_id],
+        )
+        self.assertEqual(
+            [item.route_key for item in await store.list_provider_route_health(role="leader")],
+            [route.route_key],
+        )
+
+    async def test_postgres_store_rejects_agent_slot_without_persisted_work_session(self) -> None:
+        connection = _FakeAsyncConnection()
+        store = PostgresOrchestrationStore(
+            "postgresql://unused",
+            connection_factory=lambda: connection,
+        )
+        slot = AgentSlot(
+            slot_id="leader:lane:runtime",
+            role="leader",
+            work_session_id="worksession-missing",
+            resident_team_shell_id="shell-missing",
+            status=AgentSlotStatus.BOOTING,
+            desired_state="active",
+            created_at="2026-04-12T10:00:00+00:00",
+            updated_at="2026-04-12T10:00:00+00:00",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "AgentSlot work_session_id must reference an existing WorkSession",
+        ):
+            await store.save_agent_slot(slot)
 
     async def test_postgres_store_round_trips_review_item_ref(self) -> None:
         connection = _FakeAsyncConnection()

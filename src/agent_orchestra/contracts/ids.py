@@ -85,3 +85,19 @@ def make_artifact_ref_id() -> str:
 
 def make_memory_item_id() -> str:
     return make_id("memitem")
+
+
+def make_agent_slot_id() -> str:
+    return make_id("agentslot")
+
+
+def make_agent_incarnation_id() -> str:
+    return make_id("agentinc")
+
+
+def make_slot_health_event_id() -> str:
+    return make_id("slothealth")
+
+
+def make_session_attachment_id() -> str:
+    return make_id("sessionattach")

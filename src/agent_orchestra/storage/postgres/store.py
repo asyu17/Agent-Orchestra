@@ -12,6 +12,14 @@ from agent_orchestra.contracts.agent import AgentSession
 from agent_orchestra.contracts.authority import AuthorityState
 from agent_orchestra.contracts.blackboard import BlackboardEntry, BlackboardSnapshot
 from agent_orchestra.contracts.delivery import DeliveryState, DeliveryStateKind, DeliveryStatus
+from agent_orchestra.contracts.daemon import (
+    AgentIncarnation,
+    AgentSlot,
+    ProviderRouteHealth,
+    SessionAttachment,
+    SessionAttachmentStatus,
+    SlotHealthEvent,
+)
 from agent_orchestra.contracts.enums import (
     AuthorityStatus,
     BlackboardEntryKind,
@@ -63,6 +71,7 @@ from agent_orchestra.storage.base import (
     AuthorityRequestStoreCommit,
     CoordinationOutboxRecord,
     CoordinationTransactionStoreCommit,
+    DaemonTransactionStoreCommit,
     DirectedTaskReceiptStoreCommit,
     MailboxConsumeStoreCommit,
     OrchestrationStore,
@@ -567,6 +576,26 @@ def _deserialize_session_memory_item(payload: Any) -> SessionMemoryItem:
 
 def _deserialize_resident_team_shell(payload: Any) -> ResidentTeamShell:
     return ResidentTeamShell.from_payload(_mapping(_json_load(payload, default={})))
+
+
+def _deserialize_agent_slot(payload: Any) -> AgentSlot:
+    return AgentSlot.from_payload(_mapping(_json_load(payload, default={})))
+
+
+def _deserialize_agent_incarnation(payload: Any) -> AgentIncarnation:
+    return AgentIncarnation.from_payload(_mapping(_json_load(payload, default={})))
+
+
+def _deserialize_slot_health_event(payload: Any) -> SlotHealthEvent:
+    return SlotHealthEvent.from_payload(_mapping(_json_load(payload, default={})))
+
+
+def _deserialize_session_attachment(payload: Any) -> SessionAttachment:
+    return SessionAttachment.from_payload(_mapping(_json_load(payload, default={})))
+
+
+def _deserialize_provider_route_health(payload: Any) -> ProviderRouteHealth:
+    return ProviderRouteHealth.from_payload(_mapping(_json_load(payload, default={})))
 
 
 def _deserialize_coordination_outbox_record(payload: Any) -> CoordinationOutboxRecord:
@@ -1424,6 +1453,82 @@ class PostgresOrchestrationStore(OrchestrationStore):
             )
         return normalized_runtime_generation_id
 
+    async def _require_agent_slot_on_cursor(
+        self,
+        cursor: Any,
+        *,
+        slot_id: str,
+        owner_kind: str,
+        expected_work_session_id: str | None = None,
+        allowed_new_slot_ids: tuple[str, ...] = (),
+    ) -> str:
+        normalized_slot_id = str(slot_id).strip()
+        if not normalized_slot_id:
+            raise ValueError(f"{owner_kind} slot_id must reference an existing AgentSlot")
+        if normalized_slot_id in allowed_new_slot_ids:
+            return normalized_slot_id
+        row = await self._execute_on_cursor(
+            cursor,
+            f"""
+            SELECT work_session_id
+            FROM {self.schema}.agent_slots
+            WHERE slot_id = %s;
+            """,
+            (normalized_slot_id,),
+            fetch="one",
+        )
+        if row is None:
+            raise ValueError(f"{owner_kind} slot_id must reference an existing AgentSlot")
+        if expected_work_session_id is not None and str(row[0]).strip() != expected_work_session_id:
+            raise ValueError(f"{owner_kind} slot_id must reference an existing AgentSlot")
+        return normalized_slot_id
+
+    async def _require_agent_incarnation_on_cursor(
+        self,
+        cursor: Any,
+        *,
+        incarnation_id: str | None,
+        owner_kind: str,
+        expected_work_session_id: str | None = None,
+        expected_slot_id: str | None = None,
+        required: bool = True,
+        allowed_new_incarnation_ids: tuple[str, ...] = (),
+    ) -> str | None:
+        normalized_incarnation_id = (
+            None if incarnation_id is None else str(incarnation_id).strip()
+        )
+        if normalized_incarnation_id is None or not normalized_incarnation_id:
+            if required:
+                raise ValueError(
+                    f"{owner_kind} incarnation_id must reference an existing AgentIncarnation"
+                )
+            return None
+        if normalized_incarnation_id in allowed_new_incarnation_ids:
+            return normalized_incarnation_id
+        row = await self._execute_on_cursor(
+            cursor,
+            f"""
+            SELECT slot_id, work_session_id
+            FROM {self.schema}.agent_incarnations
+            WHERE incarnation_id = %s;
+            """,
+            (normalized_incarnation_id,),
+            fetch="one",
+        )
+        if row is None:
+            raise ValueError(
+                f"{owner_kind} incarnation_id must reference an existing AgentIncarnation"
+            )
+        if expected_slot_id is not None and str(row[0]).strip() != expected_slot_id:
+            raise ValueError(
+                f"{owner_kind} incarnation_id must reference an existing AgentIncarnation"
+            )
+        if expected_work_session_id is not None and str(row[1]).strip() != expected_work_session_id:
+            raise ValueError(
+                f"{owner_kind} incarnation_id must reference an existing AgentIncarnation"
+            )
+        return normalized_incarnation_id
+
     async def _require_turn_record_on_cursor(
         self,
         cursor: Any,
@@ -2211,6 +2316,414 @@ class PostgresOrchestrationStore(OrchestrationStore):
                 created_at,
                 updated_at,
                 last_progress_at,
+                _json_param(payload),
+            ),
+        )
+
+    async def _save_agent_slot_on_cursor(
+        self,
+        cursor: Any,
+        slot: AgentSlot,
+        *,
+        allowed_new_work_session_ids: tuple[str, ...] = (),
+    ) -> None:
+        work_session_id = await self._require_work_session_on_cursor(
+            cursor,
+            work_session_id=slot.work_session_id,
+            owner_kind="AgentSlot",
+            allowed_new_work_session_ids=allowed_new_work_session_ids,
+        )
+        created_at = _normalized_required_timestamp(
+            slot.created_at,
+            owner_kind="AgentSlot",
+            field_name="created_at",
+        )
+        updated_at = _normalized_required_timestamp(
+            slot.updated_at,
+            owner_kind="AgentSlot",
+            field_name="updated_at",
+        )
+        payload = slot.to_dict()
+        payload["work_session_id"] = work_session_id
+        payload["created_at"] = created_at
+        payload["updated_at"] = updated_at
+        await self._execute_on_cursor(
+            cursor,
+            f"""
+            INSERT INTO {self.schema}.agent_slots (
+                slot_id,
+                work_session_id,
+                resident_team_shell_id,
+                role,
+                status,
+                desired_state,
+                preferred_backend,
+                preferred_transport_class,
+                current_incarnation_id,
+                current_lease_id,
+                restart_count,
+                last_failure_class,
+                created_at,
+                updated_at,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (slot_id) DO UPDATE SET
+                work_session_id = EXCLUDED.work_session_id,
+                resident_team_shell_id = EXCLUDED.resident_team_shell_id,
+                role = EXCLUDED.role,
+                status = EXCLUDED.status,
+                desired_state = EXCLUDED.desired_state,
+                preferred_backend = EXCLUDED.preferred_backend,
+                preferred_transport_class = EXCLUDED.preferred_transport_class,
+                current_incarnation_id = EXCLUDED.current_incarnation_id,
+                current_lease_id = EXCLUDED.current_lease_id,
+                restart_count = EXCLUDED.restart_count,
+                last_failure_class = EXCLUDED.last_failure_class,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                slot.slot_id,
+                work_session_id,
+                slot.resident_team_shell_id,
+                slot.role,
+                slot.status.value,
+                slot.desired_state,
+                slot.preferred_backend,
+                slot.preferred_transport_class,
+                slot.current_incarnation_id,
+                slot.current_lease_id,
+                slot.restart_count,
+                slot.last_failure_class.value if slot.last_failure_class is not None else None,
+                created_at,
+                updated_at,
+                _json_param(payload),
+            ),
+        )
+
+    async def _save_agent_incarnation_on_cursor(
+        self,
+        cursor: Any,
+        incarnation: AgentIncarnation,
+        *,
+        allowed_new_work_session_ids: tuple[str, ...] = (),
+        allowed_new_runtime_generation_ids: tuple[str, ...] = (),
+        allowed_new_slot_ids: tuple[str, ...] = (),
+    ) -> None:
+        work_session_id = await self._require_work_session_on_cursor(
+            cursor,
+            work_session_id=incarnation.work_session_id,
+            owner_kind="AgentIncarnation",
+            allowed_new_work_session_ids=allowed_new_work_session_ids,
+        )
+        slot_id = await self._require_agent_slot_on_cursor(
+            cursor,
+            slot_id=incarnation.slot_id,
+            owner_kind="AgentIncarnation",
+            expected_work_session_id=work_session_id,
+            allowed_new_slot_ids=allowed_new_slot_ids,
+        )
+        runtime_generation_id = await self._require_runtime_generation_on_cursor(
+            cursor,
+            runtime_generation_id=incarnation.runtime_generation_id,
+            work_session_id=work_session_id,
+            owner_kind="AgentIncarnation",
+            required=False,
+            allowed_new_runtime_generation_ids=allowed_new_runtime_generation_ids,
+        )
+        started_at = _normalized_required_timestamp(
+            incarnation.started_at,
+            owner_kind="AgentIncarnation",
+            field_name="started_at",
+        )
+        ended_at = _normalized_optional_timestamp(
+            incarnation.ended_at,
+            owner_kind="AgentIncarnation",
+            field_name="ended_at",
+        )
+        payload = incarnation.to_dict()
+        payload["slot_id"] = slot_id
+        payload["work_session_id"] = work_session_id
+        payload["runtime_generation_id"] = runtime_generation_id
+        payload["started_at"] = started_at
+        payload["ended_at"] = ended_at
+        await self._execute_on_cursor(
+            cursor,
+            f"""
+            INSERT INTO {self.schema}.agent_incarnations (
+                incarnation_id,
+                slot_id,
+                work_session_id,
+                runtime_generation_id,
+                status,
+                backend,
+                lease_id,
+                restart_generation,
+                started_at,
+                ended_at,
+                terminal_failure_class,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (incarnation_id) DO UPDATE SET
+                slot_id = EXCLUDED.slot_id,
+                work_session_id = EXCLUDED.work_session_id,
+                runtime_generation_id = EXCLUDED.runtime_generation_id,
+                status = EXCLUDED.status,
+                backend = EXCLUDED.backend,
+                lease_id = EXCLUDED.lease_id,
+                restart_generation = EXCLUDED.restart_generation,
+                started_at = EXCLUDED.started_at,
+                ended_at = EXCLUDED.ended_at,
+                terminal_failure_class = EXCLUDED.terminal_failure_class,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                incarnation.incarnation_id,
+                slot_id,
+                work_session_id,
+                runtime_generation_id,
+                incarnation.status.value,
+                incarnation.backend,
+                incarnation.lease_id,
+                incarnation.restart_generation,
+                started_at,
+                ended_at,
+                (
+                    incarnation.terminal_failure_class.value
+                    if incarnation.terminal_failure_class is not None
+                    else None
+                ),
+                _json_param(payload),
+            ),
+        )
+
+    async def _append_slot_health_event_on_cursor(
+        self,
+        cursor: Any,
+        event: SlotHealthEvent,
+        *,
+        allowed_new_work_session_ids: tuple[str, ...] = (),
+        allowed_new_slot_ids: tuple[str, ...] = (),
+        allowed_new_incarnation_ids: tuple[str, ...] = (),
+    ) -> None:
+        work_session_id = await self._require_work_session_on_cursor(
+            cursor,
+            work_session_id=event.work_session_id,
+            owner_kind="SlotHealthEvent",
+            allowed_new_work_session_ids=allowed_new_work_session_ids,
+        )
+        slot_id = await self._require_agent_slot_on_cursor(
+            cursor,
+            slot_id=event.slot_id,
+            owner_kind="SlotHealthEvent",
+            expected_work_session_id=work_session_id,
+            allowed_new_slot_ids=allowed_new_slot_ids,
+        )
+        incarnation_id = await self._require_agent_incarnation_on_cursor(
+            cursor,
+            incarnation_id=event.incarnation_id,
+            owner_kind="SlotHealthEvent",
+            expected_work_session_id=work_session_id,
+            expected_slot_id=slot_id,
+            required=False,
+            allowed_new_incarnation_ids=allowed_new_incarnation_ids,
+        )
+        observed_at = _normalized_required_timestamp(
+            event.observed_at,
+            owner_kind="SlotHealthEvent",
+            field_name="observed_at",
+        )
+        payload = event.to_dict()
+        payload["slot_id"] = slot_id
+        payload["work_session_id"] = work_session_id
+        payload["incarnation_id"] = incarnation_id
+        payload["observed_at"] = observed_at
+        await self._execute_on_cursor(
+            cursor,
+            f"""
+            INSERT INTO {self.schema}.slot_health_events (
+                event_id,
+                slot_id,
+                incarnation_id,
+                work_session_id,
+                event_kind,
+                failure_class,
+                observed_at,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (event_id) DO UPDATE SET
+                slot_id = EXCLUDED.slot_id,
+                incarnation_id = EXCLUDED.incarnation_id,
+                work_session_id = EXCLUDED.work_session_id,
+                event_kind = EXCLUDED.event_kind,
+                failure_class = EXCLUDED.failure_class,
+                observed_at = EXCLUDED.observed_at,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                event.event_id,
+                slot_id,
+                incarnation_id,
+                work_session_id,
+                event.event_kind,
+                event.failure_class.value if event.failure_class is not None else None,
+                observed_at,
+                _json_param(payload),
+            ),
+        )
+
+    async def _save_session_attachment_on_cursor(
+        self,
+        cursor: Any,
+        attachment: SessionAttachment,
+        *,
+        allowed_new_work_session_ids: tuple[str, ...] = (),
+        allowed_new_slot_ids: tuple[str, ...] = (),
+        allowed_new_incarnation_ids: tuple[str, ...] = (),
+    ) -> None:
+        work_session_id = await self._require_work_session_on_cursor(
+            cursor,
+            work_session_id=attachment.work_session_id,
+            owner_kind="SessionAttachment",
+            allowed_new_work_session_ids=allowed_new_work_session_ids,
+        )
+        slot_id = None
+        if attachment.slot_id:
+            slot_id = await self._require_agent_slot_on_cursor(
+                cursor,
+                slot_id=attachment.slot_id,
+                owner_kind="SessionAttachment",
+                expected_work_session_id=work_session_id,
+                allowed_new_slot_ids=allowed_new_slot_ids,
+            )
+        incarnation_id = await self._require_agent_incarnation_on_cursor(
+            cursor,
+            incarnation_id=attachment.incarnation_id,
+            owner_kind="SessionAttachment",
+            expected_work_session_id=work_session_id,
+            expected_slot_id=slot_id,
+            required=False,
+            allowed_new_incarnation_ids=allowed_new_incarnation_ids,
+        )
+        attached_at = _normalized_required_timestamp(
+            attachment.attached_at,
+            owner_kind="SessionAttachment",
+            field_name="attached_at",
+        )
+        detached_at = _normalized_optional_timestamp(
+            attachment.detached_at,
+            owner_kind="SessionAttachment",
+            field_name="detached_at",
+        )
+        payload = attachment.to_dict()
+        payload["work_session_id"] = work_session_id
+        payload["slot_id"] = slot_id
+        payload["incarnation_id"] = incarnation_id
+        payload["attached_at"] = attached_at
+        payload["detached_at"] = detached_at
+        await self._execute_on_cursor(
+            cursor,
+            f"""
+            INSERT INTO {self.schema}.session_attachments (
+                attachment_id,
+                work_session_id,
+                resident_team_shell_id,
+                slot_id,
+                incarnation_id,
+                client_id,
+                status,
+                attached_at,
+                detached_at,
+                last_event_id,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (attachment_id) DO UPDATE SET
+                work_session_id = EXCLUDED.work_session_id,
+                resident_team_shell_id = EXCLUDED.resident_team_shell_id,
+                slot_id = EXCLUDED.slot_id,
+                incarnation_id = EXCLUDED.incarnation_id,
+                client_id = EXCLUDED.client_id,
+                status = EXCLUDED.status,
+                attached_at = EXCLUDED.attached_at,
+                detached_at = EXCLUDED.detached_at,
+                last_event_id = EXCLUDED.last_event_id,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                attachment.attachment_id,
+                work_session_id,
+                attachment.resident_team_shell_id,
+                slot_id,
+                incarnation_id,
+                attachment.client_id,
+                attachment.status.value,
+                attached_at,
+                detached_at,
+                attachment.last_event_id,
+                _json_param(payload),
+            ),
+        )
+
+    async def _save_provider_route_health_on_cursor(
+        self,
+        cursor: Any,
+        route: ProviderRouteHealth,
+    ) -> None:
+        updated_at = _normalized_required_timestamp(
+            route.updated_at,
+            owner_kind="ProviderRouteHealth",
+            field_name="updated_at",
+        )
+        payload = route.to_dict()
+        payload["updated_at"] = updated_at
+        await self._execute_on_cursor(
+            cursor,
+            f"""
+            INSERT INTO {self.schema}.provider_route_health (
+                route_key,
+                role,
+                backend,
+                route_fingerprint,
+                status,
+                health_score,
+                consecutive_failures,
+                last_failure_class,
+                cooldown_expires_at,
+                preferred,
+                updated_at,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (route_key) DO UPDATE SET
+                role = EXCLUDED.role,
+                backend = EXCLUDED.backend,
+                route_fingerprint = EXCLUDED.route_fingerprint,
+                status = EXCLUDED.status,
+                health_score = EXCLUDED.health_score,
+                consecutive_failures = EXCLUDED.consecutive_failures,
+                last_failure_class = EXCLUDED.last_failure_class,
+                cooldown_expires_at = EXCLUDED.cooldown_expires_at,
+                preferred = EXCLUDED.preferred,
+                updated_at = EXCLUDED.updated_at,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                route.route_key,
+                route.role,
+                route.backend,
+                route.route_fingerprint,
+                route.status.value,
+                route.health_score,
+                route.consecutive_failures,
+                route.last_failure_class.value if route.last_failure_class is not None else None,
+                route.cooldown_expires_at,
+                route.preferred,
+                updated_at,
                 _json_param(payload),
             ),
         )
@@ -3230,6 +3743,159 @@ class PostgresOrchestrationStore(OrchestrationStore):
             return None
         return max(shells, key=_resident_team_shell_latest_key)
 
+    async def save_agent_slot(self, slot: AgentSlot) -> None:
+        await self._run_write(lambda cursor: self._save_agent_slot_on_cursor(cursor, slot))
+
+    async def get_agent_slot(self, slot_id: str) -> AgentSlot | None:
+        payload = await self._select_payload_one("agent_slots", "slot_id", slot_id)
+        return None if payload is None else _deserialize_agent_slot(payload)
+
+    async def list_agent_slots(
+        self,
+        *,
+        work_session_id: str | None = None,
+        resident_team_shell_id: str | None = None,
+    ) -> list[AgentSlot]:
+        filters: list[tuple[str, Any]] = []
+        if work_session_id is not None:
+            filters.append(("work_session_id", work_session_id))
+        if resident_team_shell_id is not None:
+            filters.append(("resident_team_shell_id", resident_team_shell_id))
+        payloads = await self._select_payload_many(
+            "agent_slots",
+            filters=tuple(filters),
+            order_by="work_session_id, role, slot_id",
+        )
+        return [_deserialize_agent_slot(payload) for payload in payloads]
+
+    async def save_agent_incarnation(self, incarnation: AgentIncarnation) -> None:
+        await self._run_write(
+            lambda cursor: self._save_agent_incarnation_on_cursor(cursor, incarnation)
+        )
+
+    async def get_agent_incarnation(
+        self,
+        incarnation_id: str,
+    ) -> AgentIncarnation | None:
+        payload = await self._select_payload_one(
+            "agent_incarnations",
+            "incarnation_id",
+            incarnation_id,
+        )
+        return None if payload is None else _deserialize_agent_incarnation(payload)
+
+    async def list_agent_incarnations(
+        self,
+        *,
+        slot_id: str | None = None,
+    ) -> list[AgentIncarnation]:
+        filters: list[tuple[str, Any]] = []
+        if slot_id is not None:
+            filters.append(("slot_id", slot_id))
+        payloads = await self._select_payload_many(
+            "agent_incarnations",
+            filters=tuple(filters),
+            order_by="slot_id, restart_generation, started_at, incarnation_id",
+        )
+        return [_deserialize_agent_incarnation(payload) for payload in payloads]
+
+    async def append_slot_health_event(self, event: SlotHealthEvent) -> None:
+        await self._run_write(lambda cursor: self._append_slot_health_event_on_cursor(cursor, event))
+
+    async def list_slot_health_events(
+        self,
+        slot_id: str,
+        *,
+        incarnation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[SlotHealthEvent]:
+        filters: list[tuple[str, Any]] = [("slot_id", slot_id)]
+        if incarnation_id is not None:
+            filters.append(("incarnation_id", incarnation_id))
+        payloads = await self._select_payload_many(
+            "slot_health_events",
+            filters=tuple(filters),
+            order_by="observed_at, event_id",
+        )
+        if limit is not None and limit >= 0:
+            payloads = payloads[-limit:] if limit else []
+        return [_deserialize_slot_health_event(payload) for payload in payloads]
+
+    async def save_session_attachment(self, attachment: SessionAttachment) -> None:
+        await self._run_write(
+            lambda cursor: self._save_session_attachment_on_cursor(cursor, attachment)
+        )
+
+    async def get_session_attachment(
+        self,
+        attachment_id: str,
+    ) -> SessionAttachment | None:
+        payload = await self._select_payload_one(
+            "session_attachments",
+            "attachment_id",
+            attachment_id,
+        )
+        return None if payload is None else _deserialize_session_attachment(payload)
+
+    async def list_session_attachments(
+        self,
+        work_session_id: str,
+        *,
+        resident_team_shell_id: str | None = None,
+        include_closed: bool = True,
+    ) -> list[SessionAttachment]:
+        filters: list[tuple[str, Any]] = [("work_session_id", work_session_id)]
+        if resident_team_shell_id is not None:
+            filters.append(("resident_team_shell_id", resident_team_shell_id))
+        payloads = await self._select_payload_many(
+            "session_attachments",
+            filters=tuple(filters),
+            order_by="attached_at, attachment_id",
+        )
+        attachments = [_deserialize_session_attachment(payload) for payload in payloads]
+        if include_closed:
+            return attachments
+        return [
+            attachment
+            for attachment in attachments
+            if attachment.status
+            not in (
+                SessionAttachmentStatus.CLOSED,
+                SessionAttachmentStatus.DETACHED,
+            )
+        ]
+
+    async def save_provider_route_health(self, route: ProviderRouteHealth) -> None:
+        await self._run_write(
+            lambda cursor: self._save_provider_route_health_on_cursor(cursor, route)
+        )
+
+    async def get_provider_route_health(
+        self,
+        route_key: str,
+    ) -> ProviderRouteHealth | None:
+        payload = await self._select_payload_one(
+            "provider_route_health",
+            "route_key",
+            route_key,
+        )
+        return None if payload is None else _deserialize_provider_route_health(payload)
+
+    async def list_provider_route_health(
+        self,
+        *,
+        role: str | None = None,
+    ) -> list[ProviderRouteHealth]:
+        filters: list[tuple[str, Any]] = []
+        if role is not None:
+            filters.append(("role", role))
+        payloads = await self._select_payload_many(
+            "provider_route_health",
+            filters=tuple(filters),
+            order_by="route_key",
+        )
+        return [_deserialize_provider_route_health(payload) for payload in payloads]
+
     async def list_reclaimable_worker_sessions(
         self,
         *,
@@ -3436,6 +4102,64 @@ class PostgresOrchestrationStore(OrchestrationStore):
     ) -> None:
         await self._run_write(
             lambda cursor: self._commit_session_transaction_on_cursor(cursor, commit)
+        )
+
+    async def _commit_daemon_transaction_on_cursor(
+        self,
+        cursor: Any,
+        commit: DaemonTransactionStoreCommit,
+    ) -> None:
+        allowed_new_work_session_ids = tuple(
+            slot.work_session_id for slot in commit.agent_slots
+        )
+        allowed_new_slot_ids = tuple(slot.slot_id for slot in commit.agent_slots)
+        allowed_new_incarnation_ids = tuple(
+            incarnation.incarnation_id for incarnation in commit.agent_incarnations
+        )
+        allowed_new_runtime_generation_ids = tuple(
+            incarnation.runtime_generation_id
+            for incarnation in commit.agent_incarnations
+            if incarnation.runtime_generation_id
+        )
+        for slot in commit.agent_slots:
+            await self._save_agent_slot_on_cursor(
+                cursor,
+                slot,
+                allowed_new_work_session_ids=allowed_new_work_session_ids,
+            )
+        for incarnation in commit.agent_incarnations:
+            await self._save_agent_incarnation_on_cursor(
+                cursor,
+                incarnation,
+                allowed_new_work_session_ids=allowed_new_work_session_ids,
+                allowed_new_runtime_generation_ids=allowed_new_runtime_generation_ids,
+                allowed_new_slot_ids=allowed_new_slot_ids,
+            )
+        for event in commit.slot_health_events:
+            await self._append_slot_health_event_on_cursor(
+                cursor,
+                event,
+                allowed_new_work_session_ids=allowed_new_work_session_ids,
+                allowed_new_slot_ids=allowed_new_slot_ids,
+                allowed_new_incarnation_ids=allowed_new_incarnation_ids,
+            )
+        for attachment in commit.session_attachments:
+            await self._save_session_attachment_on_cursor(
+                cursor,
+                attachment,
+                allowed_new_work_session_ids=allowed_new_work_session_ids,
+                allowed_new_slot_ids=allowed_new_slot_ids,
+                allowed_new_incarnation_ids=allowed_new_incarnation_ids,
+            )
+        for route in commit.provider_route_health_records:
+            await self._save_provider_route_health_on_cursor(cursor, route)
+
+    async def commit_daemon_transaction(
+        self,
+        commit: DaemonTransactionStoreCommit,
+    ) -> None:
+        await self._run_write(
+            lambda cursor: self._commit_daemon_transaction_on_cursor(cursor, commit)
         )
 
     async def commit_coordination_transaction(

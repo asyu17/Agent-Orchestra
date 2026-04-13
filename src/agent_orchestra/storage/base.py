@@ -9,6 +9,13 @@ from agent_orchestra.contracts.agent import AgentSession
 from agent_orchestra.contracts.authority import AuthorityDecision, AuthorityState, ScopeExtensionRequest
 from agent_orchestra.contracts.blackboard import BlackboardEntry, BlackboardSnapshot
 from agent_orchestra.contracts.delivery import DeliveryState
+from agent_orchestra.contracts.daemon import (
+    AgentIncarnation,
+    AgentSlot,
+    ProviderRouteHealth,
+    SessionAttachment,
+    SlotHealthEvent,
+)
 from agent_orchestra.contracts.execution import WorkerRecord, WorkerSession
 from agent_orchestra.contracts.handoff import HandoffRecord
 from agent_orchestra.contracts.hierarchical_review import (
@@ -321,6 +328,37 @@ class SessionTransactionStoreCommit:
     @property
     def resident_team_shell(self) -> ResidentTeamShell | None:
         return self.resident_team_shells[0] if self.resident_team_shells else None
+
+
+@dataclass(slots=True, frozen=True)
+class DaemonTransactionStoreCommit:
+    agent_slots: tuple[AgentSlot, ...] = ()
+    agent_incarnations: tuple[AgentIncarnation, ...] = ()
+    slot_health_events: tuple[SlotHealthEvent, ...] = ()
+    session_attachments: tuple[SessionAttachment, ...] = ()
+    provider_route_health_records: tuple[ProviderRouteHealth, ...] = ()
+
+    @property
+    def agent_slot(self) -> AgentSlot | None:
+        return self.agent_slots[0] if self.agent_slots else None
+
+    @property
+    def agent_incarnation(self) -> AgentIncarnation | None:
+        return self.agent_incarnations[0] if self.agent_incarnations else None
+
+    @property
+    def slot_health_event(self) -> SlotHealthEvent | None:
+        return self.slot_health_events[0] if self.slot_health_events else None
+
+    @property
+    def session_attachment(self) -> SessionAttachment | None:
+        return self.session_attachments[0] if self.session_attachments else None
+
+    @property
+    def provider_route_health(self) -> ProviderRouteHealth | None:
+        if not self.provider_route_health_records:
+            return None
+        return self.provider_route_health_records[0]
 
 
 @dataclass(slots=True, frozen=True)
@@ -1002,6 +1040,111 @@ class OrchestrationStore(ABC):
         work_session_id: str,
     ) -> ResidentTeamShell | None:
         raise NotImplementedError
+
+    @abstractmethod
+    async def save_agent_slot(self, slot: AgentSlot) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_agent_slot(self, slot_id: str) -> AgentSlot | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_agent_slots(
+        self,
+        *,
+        work_session_id: str | None = None,
+        resident_team_shell_id: str | None = None,
+    ) -> list[AgentSlot]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def save_agent_incarnation(self, incarnation: AgentIncarnation) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_agent_incarnation(
+        self,
+        incarnation_id: str,
+    ) -> AgentIncarnation | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_agent_incarnations(
+        self,
+        *,
+        slot_id: str | None = None,
+    ) -> list[AgentIncarnation]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def append_slot_health_event(self, event: SlotHealthEvent) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_slot_health_events(
+        self,
+        slot_id: str,
+        *,
+        incarnation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[SlotHealthEvent]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def save_session_attachment(self, attachment: SessionAttachment) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_session_attachment(
+        self,
+        attachment_id: str,
+    ) -> SessionAttachment | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_session_attachments(
+        self,
+        work_session_id: str,
+        *,
+        resident_team_shell_id: str | None = None,
+        include_closed: bool = True,
+    ) -> list[SessionAttachment]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def save_provider_route_health(self, route: ProviderRouteHealth) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_provider_route_health(
+        self,
+        route_key: str,
+    ) -> ProviderRouteHealth | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_provider_route_health(
+        self,
+        *,
+        role: str | None = None,
+    ) -> list[ProviderRouteHealth]:
+        raise NotImplementedError
+
+    async def commit_daemon_transaction(
+        self,
+        commit: DaemonTransactionStoreCommit,
+    ) -> None:
+        for slot in commit.agent_slots:
+            await self.save_agent_slot(slot)
+        for incarnation in commit.agent_incarnations:
+            await self.save_agent_incarnation(incarnation)
+        for event in commit.slot_health_events:
+            await self.append_slot_health_event(event)
+        for attachment in commit.session_attachments:
+            await self.save_session_attachment(attachment)
+        for route in commit.provider_route_health_records:
+            await self.save_provider_route_health(route)
 
     @abstractmethod
     async def list_reclaimable_worker_sessions(

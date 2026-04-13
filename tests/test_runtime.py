@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import importlib.util
+import json
 import sys
+import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
 
@@ -13,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from agent_orchestra.bus.in_memory import InMemoryEventBus
-from agent_orchestra.contracts.agent import AgentSession
+from agent_orchestra.contracts.agent import AgentSession, SessionBinding
 from agent_orchestra.contracts.authority import (
     AuthorityBoundaryClass,
     AuthorityCompletionStatus,
@@ -27,7 +30,11 @@ from agent_orchestra.contracts.enums import AuthorityStatus, EventKind, WorkerSt
 from agent_orchestra.contracts.enums import SpecEdgeKind, SpecNodeKind, TaskScope, TaskStatus
 from agent_orchestra.contracts.execution import (
     ResidentCoordinatorPhase,
+    ResidentCoordinatorSession,
     WorkerAssignment,
+    WorkerBackendCapabilities,
+    WorkerExecutionPolicy,
+    WorkerHandle,
     WorkerRecord,
     WorkerSession,
     WorkerSessionStatus,
@@ -53,6 +60,9 @@ from agent_orchestra.contracts.task import (
 )
 from agent_orchestra.planning.template import ObjectiveTemplate, WorkstreamTemplate
 from agent_orchestra.planning.template_planner import TemplatePlanner
+from agent_orchestra.daemon.client import DaemonClient
+from agent_orchestra.daemon.server import DaemonServer
+from agent_orchestra.runtime import build_in_memory_orchestra
 from agent_orchestra.runtime.backends.in_process import InProcessLaunchBackend
 from agent_orchestra.runtime.authority_reactor import collect_lane_authority_completion_snapshot
 from agent_orchestra.runtime.group_runtime import GroupRuntime
@@ -61,6 +71,69 @@ from agent_orchestra.runtime.worker_supervisor import DefaultWorkerSupervisor
 from agent_orchestra.runtime.session_continuity import SessionContinuityState, SessionInspectSnapshot
 from agent_orchestra.storage.in_memory import InMemoryOrchestrationStore
 from agent_orchestra.tools.mailbox import MailboxDeliveryMode, MailboxDigest, MailboxSubscription, MailboxVisibilityScope
+
+
+class _SequencedDaemonBackend:
+    def __init__(self, *, root: Path, results: list[dict[str, object]]) -> None:
+        self.root = root
+        self.results = list(results)
+        self.launch_count = 0
+
+    def describe_capabilities(self) -> WorkerBackendCapabilities:
+        return WorkerBackendCapabilities(
+            supports_protocol_contract=True,
+            supports_protocol_state=True,
+            supports_protocol_final_report=False,
+            supports_resume=False,
+            supports_reactivate=False,
+            supports_artifact_progress=False,
+            supports_verification_in_working_dir=True,
+        )
+
+    async def launch(self, assignment: WorkerAssignment) -> WorkerHandle:
+        self.launch_count += 1
+        index = self.launch_count - 1
+        step = self.results[index]
+        result_file = self.root / f"{assignment.assignment_id}.launch-{self.launch_count}.result.json"
+        protocol_file = self.root / f"{assignment.assignment_id}.launch-{self.launch_count}.protocol.json"
+        raw_payload = dict(step.get("raw_payload", {}))
+        protocol_file.write_text(json.dumps({"protocol_events": []}), encoding="utf-8")
+        result_file.write_text(
+            json.dumps(
+                {
+                    "worker_id": assignment.worker_id,
+                    "assignment_id": assignment.assignment_id,
+                    "status": step.get("status", "completed"),
+                    "output_text": step.get("output_text", ""),
+                    "error_text": step.get("error_text", ""),
+                    "response_id": step.get("response_id"),
+                    "usage": {},
+                    "raw_payload": raw_payload,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return WorkerHandle(
+            worker_id=assignment.worker_id,
+            role=assignment.role,
+            backend=assignment.backend,
+            run_id=assignment.assignment_id,
+            transport_ref=str(result_file),
+            metadata={
+                "protocol_state_file": str(protocol_file),
+                "resume_supported": False,
+            },
+        )
+
+    async def cancel(self, handle: WorkerHandle) -> None:
+        return None
+
+    async def resume(
+        self,
+        handle: WorkerHandle,
+        assignment: WorkerAssignment | None = None,
+    ) -> WorkerHandle:
+        return handle
 
 
 class _FakeRunner(AgentRunner):
@@ -168,6 +241,186 @@ class _AuthoritativeAuthorityCommitStore(InMemoryOrchestrationStore):
 
 
 class RuntimeTest(IsolatedAsyncioTestCase):
+    async def test_daemon_server_keeps_live_session_attachable_after_client_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "agent-orchestra.sock"
+            orchestra = build_in_memory_orchestra()
+            server = DaemonServer(socket_path=str(socket_path), orchestra=orchestra)
+            await server.start()
+            try:
+                first_client = DaemonClient(socket_path=str(socket_path))
+                created = await first_client.request(
+                    "session.new",
+                    {
+                        "group_id": "group-a",
+                        "objective_id": "objective-1",
+                        "title": "Daemon attach lifecycle",
+                    },
+                )
+                work_session_id = created["continuity"]["work_session"]["work_session_id"]
+                runtime_generation_id = created["continuity"]["runtime_generation"]["runtime_generation_id"]
+                session_host = orchestra.supervisor.session_host
+                leader_session_id = "objective-1:lane-runtime:leader:resident"
+                metadata = {
+                    "group_id": "group-a",
+                    "work_session_id": work_session_id,
+                    "runtime_generation_id": runtime_generation_id,
+                }
+                await session_host.load_or_create_coordinator_session(
+                    session_id=leader_session_id,
+                    coordinator_id="leader:runtime",
+                    objective_id="objective-1",
+                    lane_id="lane-runtime",
+                    team_id="team-runtime",
+                    role="leader",
+                    host_owner_coordinator_id="superleader:objective-1",
+                    runtime_task_id="runtime-task-1",
+                    metadata=metadata,
+                )
+                await session_host.bind_session(
+                    leader_session_id,
+                    SessionBinding(
+                        session_id=leader_session_id,
+                        backend="tmux",
+                        binding_type="resident",
+                        transport_locator={"session_name": "ao-runtime", "pane_id": "%9"},
+                        supervisor_id="daemon-supervisor",
+                        lease_id="lease-live",
+                        lease_expires_at="2026-04-13T12:30:00+00:00",
+                    ),
+                )
+                await session_host.record_coordinator_session_state(
+                    leader_session_id,
+                    coordinator_session=ResidentCoordinatorSession(
+                        coordinator_id="leader:runtime",
+                        role="leader",
+                        phase=ResidentCoordinatorPhase.WAITING_FOR_MAILBOX,
+                        objective_id="objective-1",
+                        lane_id="lane-runtime",
+                        team_id="team-runtime",
+                        cycle_count=1,
+                        prompt_turn_count=1,
+                        claimed_task_count=0,
+                        subordinate_dispatch_count=0,
+                        mailbox_poll_count=1,
+                        mailbox_cursor="leader-envelope-live",
+                        last_reason="Waiting for mailbox.",
+                    ),
+                    last_progress_at="2026-04-13T12:00:00+00:00",
+                )
+                del first_client
+
+                second_client = DaemonClient(socket_path=str(socket_path))
+                inspected = await second_client.request(
+                    "session.inspect",
+                    {"work_session_id": work_session_id},
+                )
+                attached = await second_client.request(
+                    "session.attach",
+                    {"work_session_id": work_session_id},
+                )
+
+                self.assertTrue(server.is_running)
+                self.assertEqual(
+                    inspected["snapshot"]["resident_shell_views"][0]["attach_recommendation"]["mode"],
+                    "attached",
+                )
+                self.assertEqual(attached["result"]["action"], "attached")
+                self.assertEqual(attached["result"]["metadata"]["preferred_session_id"], leader_session_id)
+            finally:
+                await server.close()
+
+    async def test_daemon_server_replaces_abnormal_slot_and_emits_restart_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "agent-orchestra.sock"
+            backend = _SequencedDaemonBackend(
+                root=Path(tmpdir),
+                results=[
+                    {
+                        "status": "failed",
+                        "error_text": "worker transport died",
+                        "raw_payload": {
+                            "failure_is_process_termination": True,
+                            "failure_tags": ["process_termination"],
+                        },
+                    },
+                    {
+                        "status": "completed",
+                        "output_text": "replacement succeeded",
+                        "raw_payload": {},
+                    },
+                ],
+            )
+            orchestra = build_in_memory_orchestra(launch_backends={"scripted": backend})
+            runtime = orchestra.group_runtime()
+            server = DaemonServer(socket_path=str(socket_path), orchestra=orchestra)
+            await server.start()
+            try:
+                client = DaemonClient(socket_path=str(socket_path))
+                created = await client.request(
+                    "session.new",
+                    {
+                        "group_id": "group-a",
+                        "objective_id": "objective-restart",
+                        "title": "Restart lifecycle",
+                    },
+                )
+                work_session_id = created["continuity"]["work_session"]["work_session_id"]
+                runtime_generation_id = created["continuity"]["runtime_generation"]["runtime_generation_id"]
+                event_stream = client.stream_session_events(work_session_id=work_session_id)
+                
+                async def _next_restart_event() -> dict[str, object]:
+                    async for event in event_stream:
+                        if event.get("command") == "slot.restart_queued":
+                            return event
+                    raise AssertionError("session event stream closed before slot.restart_queued")
+
+                event_task = asyncio.create_task(_next_restart_event())
+                await asyncio.sleep(0.05)
+
+                first_record = await runtime.run_worker_assignment(
+                    WorkerAssignment(
+                        assignment_id="assign-restart",
+                        worker_id="worker-restart",
+                        group_id="group-a",
+                        team_id="team-a",
+                        task_id="task-restart",
+                        role="teammate",
+                        backend="scripted",
+                        instructions="Retry after process termination.",
+                        input_text="run",
+                        metadata={
+                            "work_session_id": work_session_id,
+                            "runtime_generation_id": runtime_generation_id,
+                            "slot_id": "slot:team-a:teammate:1",
+                        },
+                    ),
+                    policy=WorkerExecutionPolicy(
+                        max_attempts=1,
+                        allow_relaunch=False,
+                        escalate_after_attempts=False,
+                    ),
+                )
+                self.assertEqual(first_record.status, WorkerStatus.FAILED)
+                restart_event = await asyncio.wait_for(event_task, timeout=3.0)
+                await event_stream.aclose()
+                await asyncio.sleep(0.6)
+
+                slot = await orchestra.store.get_agent_slot("slot:team-a:teammate:1")
+                incarnations = await orchestra.store.list_agent_incarnations(
+                    slot_id="slot:team-a:teammate:1"
+                )
+
+                self.assertEqual(restart_event["command"], "slot.restart_queued")
+                self.assertEqual(restart_event["work_session_id"], work_session_id)
+                self.assertIsNotNone(slot)
+                assert slot is not None
+                self.assertEqual(slot.restart_count, 1)
+                self.assertEqual(backend.launch_count, 2)
+                self.assertGreaterEqual(len(incarnations), 2)
+            finally:
+                await server.close()
+
     async def test_group_runtime_accepts_session_domain_service_for_user_visible_session_calls(self) -> None:
         store = InMemoryOrchestrationStore()
         bus = InMemoryEventBus()

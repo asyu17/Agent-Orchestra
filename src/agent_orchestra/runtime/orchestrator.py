@@ -111,3 +111,37 @@ def build_postgres_orchestra(
         launch_backends=launch_backends,
         supervisor=supervisor,
     )
+
+
+def build_orchestra_for_store_backend(
+    *,
+    store_backend: str,
+    dsn: str | None = None,
+    schema: str = "agent_orchestra",
+    bus: EventBus | None = None,
+    runner: AgentRunner | None = None,
+    planner: Planner | None = None,
+    launch_backends: dict[str, LaunchBackend] | None = None,
+    supervisor: DefaultWorkerSupervisor | None = None,
+) -> AgentOrchestra:
+    normalized_backend = store_backend.strip().lower()
+    if normalized_backend == "in-memory":
+        return build_in_memory_orchestra(
+            runner=runner,
+            planner=planner,
+            launch_backends=launch_backends,
+            supervisor=supervisor,
+        )
+    if normalized_backend == "postgres":
+        if dsn is None or not dsn.strip():
+            raise ValueError("`--dsn` is required when --store-backend=postgres.")
+        return build_postgres_orchestra(
+            dsn=dsn,
+            schema=schema,
+            bus=bus,
+            runner=runner,
+            planner=planner,
+            launch_backends=launch_backends,
+            supervisor=supervisor,
+        )
+    raise ValueError(f"Unsupported store backend: {store_backend}")

@@ -11,6 +11,14 @@ from agent_orchestra.contracts.agent import AgentSession
 from agent_orchestra.contracts.authority import AuthorityState
 from agent_orchestra.contracts.blackboard import BlackboardEntry, BlackboardSnapshot
 from agent_orchestra.contracts.delivery import DeliveryState
+from agent_orchestra.contracts.daemon import (
+    AgentIncarnation,
+    AgentSlot,
+    ProviderRouteHealth,
+    SessionAttachment,
+    SessionAttachmentStatus,
+    SlotHealthEvent,
+)
 from agent_orchestra.contracts.enums import TaskStatus
 from agent_orchestra.contracts.execution import WorkerRecord, WorkerSession, WorkerSessionStatus
 from agent_orchestra.contracts.handoff import HandoffRecord
@@ -52,6 +60,7 @@ from agent_orchestra.storage.base import (
     AuthorityRequestStoreCommit,
     CoordinationOutboxRecord,
     CoordinationTransactionStoreCommit,
+    DaemonTransactionStoreCommit,
     DirectedTaskReceiptStoreCommit,
     MailboxConsumeStoreCommit,
     OrchestrationStore,
@@ -128,6 +137,11 @@ class InMemoryOrchestrationStore(OrchestrationStore):
         self.artifact_refs: dict[str, ArtifactRef] = {}
         self.session_memory_items: dict[str, SessionMemoryItem] = {}
         self.resident_team_shells: dict[str, ResidentTeamShell] = {}
+        self.agent_slots: dict[str, AgentSlot] = {}
+        self.agent_incarnations: dict[str, AgentIncarnation] = {}
+        self.slot_health_events: dict[str, SlotHealthEvent] = {}
+        self.session_attachments: dict[str, SessionAttachment] = {}
+        self.provider_route_health: dict[str, ProviderRouteHealth] = {}
         self.protocol_bus_cursors: dict[tuple[str, str], dict[str, Any]] = {}
         self.delivery_states: dict[str, DeliveryState] = {}
         self.coordination_outbox_records: list[CoordinationOutboxRecord] = []
@@ -948,6 +962,164 @@ class InMemoryOrchestrationStore(OrchestrationStore):
         latest = max(shells, key=_resident_team_shell_latest_key)
         return ResidentTeamShell.from_payload(_json_safe_copy(latest.to_dict()))
 
+    async def save_agent_slot(self, slot: AgentSlot) -> None:
+        self.agent_slots[slot.slot_id] = AgentSlot.from_dict(_json_safe_copy(slot.to_dict()))
+
+    async def get_agent_slot(self, slot_id: str) -> AgentSlot | None:
+        slot = self.agent_slots.get(slot_id)
+        if slot is None:
+            return None
+        return AgentSlot.from_dict(_json_safe_copy(slot.to_dict()))
+
+    async def list_agent_slots(
+        self,
+        *,
+        work_session_id: str | None = None,
+        resident_team_shell_id: str | None = None,
+    ) -> list[AgentSlot]:
+        slots = [
+            slot
+            for slot in self.agent_slots.values()
+            if (work_session_id is None or slot.work_session_id == work_session_id)
+            and (
+                resident_team_shell_id is None
+                or slot.resident_team_shell_id == resident_team_shell_id
+            )
+        ]
+        slots.sort(key=lambda item: (item.work_session_id, item.role, item.slot_id))
+        return [AgentSlot.from_dict(_json_safe_copy(slot.to_dict())) for slot in slots]
+
+    async def save_agent_incarnation(self, incarnation: AgentIncarnation) -> None:
+        self.agent_incarnations[incarnation.incarnation_id] = AgentIncarnation.from_dict(
+            _json_safe_copy(incarnation.to_dict())
+        )
+
+    async def get_agent_incarnation(
+        self,
+        incarnation_id: str,
+    ) -> AgentIncarnation | None:
+        incarnation = self.agent_incarnations.get(incarnation_id)
+        if incarnation is None:
+            return None
+        return AgentIncarnation.from_dict(_json_safe_copy(incarnation.to_dict()))
+
+    async def list_agent_incarnations(
+        self,
+        *,
+        slot_id: str | None = None,
+    ) -> list[AgentIncarnation]:
+        incarnations = [
+            incarnation
+            for incarnation in self.agent_incarnations.values()
+            if slot_id is None or incarnation.slot_id == slot_id
+        ]
+        incarnations.sort(
+            key=lambda item: (
+                item.slot_id,
+                item.restart_generation,
+                item.started_at,
+                item.incarnation_id,
+            )
+        )
+        return [
+            AgentIncarnation.from_dict(_json_safe_copy(incarnation.to_dict()))
+            for incarnation in incarnations
+        ]
+
+    async def append_slot_health_event(self, event: SlotHealthEvent) -> None:
+        self.slot_health_events[event.event_id] = SlotHealthEvent.from_dict(
+            _json_safe_copy(event.to_dict())
+        )
+
+    async def list_slot_health_events(
+        self,
+        slot_id: str,
+        *,
+        incarnation_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[SlotHealthEvent]:
+        events = [
+            event
+            for event in self.slot_health_events.values()
+            if event.slot_id == slot_id
+            and (incarnation_id is None or event.incarnation_id == incarnation_id)
+        ]
+        events.sort(key=lambda item: (item.observed_at, item.event_id))
+        if limit is not None and limit >= 0:
+            events = events[-limit:] if limit else []
+        return [SlotHealthEvent.from_dict(_json_safe_copy(event.to_dict())) for event in events]
+
+    async def save_session_attachment(self, attachment: SessionAttachment) -> None:
+        self.session_attachments[attachment.attachment_id] = SessionAttachment.from_dict(
+            _json_safe_copy(attachment.to_dict())
+        )
+
+    async def get_session_attachment(
+        self,
+        attachment_id: str,
+    ) -> SessionAttachment | None:
+        attachment = self.session_attachments.get(attachment_id)
+        if attachment is None:
+            return None
+        return SessionAttachment.from_dict(_json_safe_copy(attachment.to_dict()))
+
+    async def list_session_attachments(
+        self,
+        work_session_id: str,
+        *,
+        resident_team_shell_id: str | None = None,
+        include_closed: bool = True,
+    ) -> list[SessionAttachment]:
+        attachments = [
+            attachment
+            for attachment in self.session_attachments.values()
+            if attachment.work_session_id == work_session_id
+            and (
+                resident_team_shell_id is None
+                or attachment.resident_team_shell_id == resident_team_shell_id
+            )
+            and (
+                include_closed
+                or attachment.status
+                not in (
+                    SessionAttachmentStatus.CLOSED,
+                    SessionAttachmentStatus.DETACHED,
+                )
+            )
+        ]
+        attachments.sort(key=lambda item: (item.attached_at, item.attachment_id))
+        return [
+            SessionAttachment.from_dict(_json_safe_copy(attachment.to_dict()))
+            for attachment in attachments
+        ]
+
+    async def save_provider_route_health(self, route: ProviderRouteHealth) -> None:
+        self.provider_route_health[route.route_key] = ProviderRouteHealth.from_dict(
+            _json_safe_copy(route.to_dict())
+        )
+
+    async def get_provider_route_health(
+        self,
+        route_key: str,
+    ) -> ProviderRouteHealth | None:
+        route = self.provider_route_health.get(route_key)
+        if route is None:
+            return None
+        return ProviderRouteHealth.from_dict(_json_safe_copy(route.to_dict()))
+
+    async def list_provider_route_health(
+        self,
+        *,
+        role: str | None = None,
+    ) -> list[ProviderRouteHealth]:
+        routes = [
+            route
+            for route in self.provider_route_health.values()
+            if role is None or route.role == role
+        ]
+        routes.sort(key=lambda item: item.route_key)
+        return [ProviderRouteHealth.from_dict(_json_safe_copy(route.to_dict())) for route in routes]
+
     async def list_reclaimable_worker_sessions(
         self,
         *,
@@ -1106,6 +1278,32 @@ class InMemoryOrchestrationStore(OrchestrationStore):
                     payload["created_at"] = existing.created_at
                 self.resident_team_shells[resident_shell.resident_team_shell_id] = (
                     ResidentTeamShell.from_payload(payload)
+                )
+
+    async def commit_daemon_transaction(
+        self,
+        commit: DaemonTransactionStoreCommit,
+    ) -> None:
+        async with self._coordination_commit_lock:
+            for slot in commit.agent_slots:
+                self.agent_slots[slot.slot_id] = AgentSlot.from_dict(
+                    _json_safe_copy(slot.to_dict())
+                )
+            for incarnation in commit.agent_incarnations:
+                self.agent_incarnations[incarnation.incarnation_id] = AgentIncarnation.from_dict(
+                    _json_safe_copy(incarnation.to_dict())
+                )
+            for event in commit.slot_health_events:
+                self.slot_health_events[event.event_id] = SlotHealthEvent.from_dict(
+                    _json_safe_copy(event.to_dict())
+                )
+            for attachment in commit.session_attachments:
+                self.session_attachments[attachment.attachment_id] = SessionAttachment.from_dict(
+                    _json_safe_copy(attachment.to_dict())
+                )
+            for route in commit.provider_route_health_records:
+                self.provider_route_health[route.route_key] = ProviderRouteHealth.from_dict(
+                    _json_safe_copy(route.to_dict())
                 )
 
     async def commit_coordination_transaction(

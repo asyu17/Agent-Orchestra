@@ -18,12 +18,21 @@
   - `src/agent_orchestra/runtime/session_domain.py`
   - `src/agent_orchestra/runtime/session_host.py`
   - `src/agent_orchestra/runtime/worker_supervisor.py`
+  - `src/agent_orchestra/contracts/daemon.py`
+  - `src/agent_orchestra/daemon/server.py`
+  - `src/agent_orchestra/daemon/client.py`
+  - `src/agent_orchestra/daemon/slot_manager.py`
+  - `src/agent_orchestra/daemon/supervisor.py`
   - `src/agent_orchestra/runtime/backends/codex_cli_backend.py`
   - `src/agent_orchestra/runtime/backends/tmux_backend.py`
   - `src/agent_orchestra/cli/main.py`
   - `src/agent_orchestra/cli/app.py`
+  - `src/agent_orchestra/cli/daemon_app.py`
+  - `tests/test_daemon_server.py`
+  - `tests/test_cli.py`
+  - `tests/test_slot_supervisor.py`
 
-下面出现的“判断”是基于上述代码与设计的架构推断，不表示仓库当前已经实现 daemon/backend 形态。
+下面出现的“判断”是基于上述代码与设计的架构推断；但从 2026-04-12 这轮实现开始，仓库里已经不再只是纯设计文档，daemon/backend 主线已有 first-cut 落地。
 
 ## 3. 为什么这条线比“只做 watchdog”更正确
 
@@ -131,7 +140,51 @@ CLI 不再拥有长生命周期 runtime truth。
 5. 把 attach 做成 live stream，而不是静态 inspect
 6. 再补 sticky provider routing、approval broker、planner feedback
 
-## 7. 对当前脆弱性的意义
+## 7. 当前实现状态
+
+截至 2026-04-12，这条线已经进入代码主线的 first-cut 状态，而不是停留在设计层：
+
+- daemon control plane 已存在：
+  - `DaemonServer` / `DaemonClient` / `protocol.py` / `registry.py` / `event_stream.py` 已实现 Unix socket IPC、request/response，以及 `session.events` 订阅流
+- CLI 已切成 thin client：
+  - `server start/status/stop`
+  - `session new/list/inspect/attach/wake/fork/events/send`
+  - `session` 默认走 `--control-plane daemon`
+  - `server start --no-foreground` 已支持后台常驻启动
+- durable daemon objects 已存在：
+  - `AgentSlot`
+  - `AgentIncarnation`
+  - `SlotHealthEvent`
+  - `SessionAttachment`
+  - `ProviderRouteHealth`
+- slot supervision 已进入主线：
+  - `SlotManager` 负责稳定 slot identity 与 first incarnation materialization
+  - `SlotSupervisor` 负责 terminal record classification、stale-incarnation fencing、abnormal replacement
+- daemon 已拥有 background supervision first-cut：
+  - 常驻 loop 会 materialize active worker sessions 成 slot/incarnation
+  - terminal worker records 会被 daemon 读取并送入 `SlotSupervisor`
+  - `recoverable_abnormal` 会生成 replacement incarnation，并尝试用现有 runtime/session truth 触发 restart
+  - `event_stream.py` 现在还带有小型 replay buffer，`slot.restart_queued` 这类 ephemeral daemon event 不会再因为 `session.events` 订阅建立竞态直接丢失
+- runtime truth 已开始显式透传 slot/incarnation 元数据：
+  - `WorkerSession` / `WorkerRecord` 现在已有 `slot_id / incarnation_id / slot_lease_id / incarnation_status`
+  - `DefaultWorkerSupervisor` 会在 active session persist、snapshot 和 host projection 时保留这些字段，并继续把 `work_session_id / runtime_generation_id` 跟着 worker-session durable truth 一起写下去
+  - `SessionDomainService.exact_wake(...)` 也会把 recovered `slot_ids / incarnation_ids` 暴露给控制面
+- session 交互面已不再只有 inspect/attach：
+  - `session.send` 现在会写入 `WorkSessionMessage` 与 `SessionEvent`
+  - daemon event stream 不再只是单次 RPC 回包，而会后台 relay 已知 work session 的 durable session events
+  - `session.inspect` 与 `session.attach / wake / exact_wake` 现在还会显式导出 `provider_route_health`
+- provider health memory 已进入 worker-supervisor 主线：
+  - `DefaultWorkerSupervisor` 现在会在每轮 assignment finalize 后持久化 `ProviderRouteHealth`
+  - 路由健康记录使用稳定 `role:route_id` key，并带上 `work_session_id / objective_id / provider_route_id`
+  - `provider_unavailable` exhaustion 会把路由写成 `quarantined + cooldown_expires_at`
+  - 最终成功路由会被写成 `healthy + preferred`
+
+判断：
+
+- 这仍然是 first-cut resident backend，而不是最终 fully-hardened 形态。
+- 真正更强的下一层仍然包括 sticky route selection、更加正式的 restart policy、以及不靠 polling 的 runtime-native event publication；但 `ProviderRouteHealth` 的 durable memory 与 attach/read-model 暴露已不再只是设计缺口。
+
+## 8. 对当前脆弱性的意义
 
 这条线可以同时解决当前几类问题：
 
@@ -145,7 +198,7 @@ CLI 不再拥有长生命周期 runtime truth。
 - 这比单纯继续加 timeout/retry 更接近根治。
 - 这也比只做 watchdog 更完整，因为它把 supervision、session、attach、runtime owner 一并统一起来了。
 
-## 8. 相关文档
+## 9. 相关文档
 
 - `docs/superpowers/specs/2026-04-12-agent-orchestra-resident-daemon-backend-and-session-attach-design.md`
 - `resource/knowledge/agent-orchestra-runtime/session-domain-and-durable-persistence.md`

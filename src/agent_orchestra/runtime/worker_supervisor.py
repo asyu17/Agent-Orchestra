@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from agent_orchestra.contracts.agent import AgentSession, SessionBinding
 from agent_orchestra.contracts.authority import ScopeExtensionRequest
+from agent_orchestra.contracts.daemon import ProviderRouteHealth, ProviderRouteStatus, SlotFailureClass
 from agent_orchestra.contracts.enums import WorkerStatus
 from agent_orchestra.contracts.execution import (
     LaunchBackend,
@@ -32,6 +33,7 @@ from agent_orchestra.contracts.execution import (
     WorkerSessionStatus,
     WorkerSupervisor,
 )
+from agent_orchestra.contracts.ids import make_agent_incarnation_id
 from agent_orchestra.contracts.runner import AgentRunner, RunnerTurnRequest
 from agent_orchestra.contracts.worker_protocol import (
     WorkerExecutionContract,
@@ -64,6 +66,13 @@ def _signal_name(signum: int) -> str | None:
         return signal.Signals(signum).name
     except ValueError:
         return None
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _policy_metadata(policy: WorkerExecutionPolicy) -> dict[str, object]:
@@ -299,6 +308,10 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             last_response_id=state.last_response_id,
             reactivation_count=state.reactivation_count,
             handle_snapshot=self.transport_adapter.snapshot_handle(handle),
+            slot_id=_optional_string(state.metadata.get("slot_id")),
+            incarnation_id=_optional_string(state.metadata.get("incarnation_id")),
+            slot_lease_id=_optional_string(state.metadata.get("slot_lease_id")),
+            incarnation_status=_optional_string(state.metadata.get("incarnation_status")),
             metadata=dict(state.metadata),
         )
 
@@ -521,6 +534,52 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             if lease_policy is not None:
                 return lease_policy
         return None
+
+    def _apply_slot_tracking_metadata(
+        self,
+        *,
+        state: _ActiveWorkerSession,
+        assignment: WorkerAssignment,
+        handle: WorkerHandle,
+        force_new_incarnation: bool,
+    ) -> None:
+        slot_id = (
+            _optional_string(handle.metadata.get("slot_id"))
+            or _optional_string(assignment.metadata.get("slot_id"))
+            or _optional_string(state.metadata.get("slot_id"))
+            or f"slot:{assignment.worker_id}"
+        )
+        incarnation_id = (
+            _optional_string(handle.metadata.get("incarnation_id"))
+            or _optional_string(assignment.metadata.get("incarnation_id"))
+            or (
+                None
+                if force_new_incarnation
+                else _optional_string(state.metadata.get("incarnation_id"))
+            )
+            or make_agent_incarnation_id()
+        )
+        slot_lease_id = (
+            _optional_string(state.supervisor_lease_id)
+            or _optional_string(handle.metadata.get("slot_lease_id"))
+            or _optional_string(assignment.metadata.get("slot_lease_id"))
+            or _optional_string(state.metadata.get("slot_lease_id"))
+        )
+        incarnation_status = (
+            _optional_string(handle.metadata.get("incarnation_status"))
+            or _optional_string(assignment.metadata.get("incarnation_status"))
+            or "active"
+        )
+        state.metadata["slot_id"] = slot_id
+        state.metadata["incarnation_id"] = incarnation_id
+        if slot_lease_id is not None:
+            state.metadata["slot_lease_id"] = slot_lease_id
+        state.metadata["incarnation_status"] = incarnation_status
+        handle.metadata["slot_id"] = slot_id
+        handle.metadata["incarnation_id"] = incarnation_id
+        if slot_lease_id is not None:
+            handle.metadata["slot_lease_id"] = slot_lease_id
+        handle.metadata["incarnation_status"] = incarnation_status
 
     def _protocol_events_from_result(self, result: WorkerResult) -> tuple[WorkerLifecycleEvent, ...]:
         payload = result.raw_payload.get("protocol_events")
@@ -1118,6 +1177,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                                 selected_route=route.route_id,
                                 exhausted=False,
                             ),
+                            provider_routes=routes,
                         )
                 elif operation == "reactivate":
                     if active_session is None:
@@ -1160,6 +1220,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                                 selected_route=route.route_id,
                                 exhausted=False,
                             ),
+                            provider_routes=routes,
                         )
                     active_session.handle = active_handle
                     active_session.status = WorkerSessionStatus.ACTIVE
@@ -1249,6 +1310,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                             selected_route=route.route_id,
                             exhausted=False,
                         ),
+                        provider_routes=routes,
                     )
                 if decision == WorkerAttemptDecision.RESUME:
                     operation = "resume"
@@ -1342,6 +1404,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                         selected_route=route.route_id,
                         exhausted=failure_kind == WorkerFailureKind.PROVIDER_UNAVAILABLE,
                     ),
+                    provider_routes=routes,
                 )
             else:
                 continue
@@ -1387,6 +1450,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                 selected_route=str(selected_route),
                 exhausted=exhausted,
             ),
+            provider_routes=routes,
         )
 
     def _build_attempt_record(
@@ -1724,16 +1788,35 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
         state.idle_since = None
         if not state.lifecycle_status:
             state.lifecycle_status = WorkerLifecycleStatus.RUNNING.value
+        self._apply_slot_tracking_metadata(
+            state=state,
+            assignment=assignment,
+            handle=handle,
+            force_new_incarnation=force_new_lease_id,
+        )
         state.metadata.update(
             {
                 "group_id": assignment.group_id,
                 "task_id": assignment.task_id,
+                "instructions": assignment.instructions,
+                "input_text": assignment.input_text,
                 "worker_session_id": state.session_id,
                 "bound_worker_session_id": state.session_id,
                 "current_worker_session_id": state.session_id,
                 "last_worker_session_id": state.session_id,
             }
         )
+        for key in (
+            "work_session_id",
+            "runtime_generation_id",
+            "resident_team_shell_id",
+            "desired_state",
+            "preferred_backend",
+            "preferred_transport_class",
+        ):
+            value = _optional_string(assignment.metadata.get(key))
+            if value is not None:
+                state.metadata[key] = value
         if assignment.objective_id is not None:
             state.metadata["objective_id"] = assignment.objective_id
         if assignment.team_id is not None:
@@ -1766,6 +1849,14 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
     def _assignment_from_session(self, session: WorkerSession) -> WorkerAssignment:
         metadata = dict(session.metadata)
         metadata.setdefault("worker_session_id", session.session_id)
+        if session.slot_id is not None:
+            metadata["slot_id"] = session.slot_id
+        if session.incarnation_id is not None:
+            metadata["incarnation_id"] = session.incarnation_id
+        if session.slot_lease_id is not None:
+            metadata["slot_lease_id"] = session.slot_lease_id
+        if session.incarnation_status is not None:
+            metadata["incarnation_status"] = session.incarnation_status
         if session.supervisor_id is not None:
             metadata["supervisor_id"] = session.supervisor_id
         if session.supervisor_lease_id is not None:
@@ -1921,6 +2012,10 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             last_response_id=state.last_response_id or record.response_id,
             reactivation_count=state.reactivation_count,
             handle_snapshot=self.transport_adapter.snapshot_handle(handle),
+            slot_id=_optional_string(state.metadata.get("slot_id")),
+            incarnation_id=_optional_string(state.metadata.get("incarnation_id")),
+            slot_lease_id=_optional_string(state.metadata.get("slot_lease_id")),
+            incarnation_status=_optional_string(state.metadata.get("incarnation_status")),
             metadata=dict(state.metadata),
         )
 
@@ -2001,6 +2096,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
         handle: WorkerHandle | None = None,
         session_state: _ActiveWorkerSession | None = None,
         provider_routing: dict[str, object] | None = None,
+        provider_routes: tuple[WorkerProviderRoute, ...] | None = None,
     ) -> WorkerRecord:
         metadata = dict(record.metadata)
         metadata["task_id"] = assignment.task_id
@@ -2025,6 +2121,24 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             metadata.get("backend_cancel_invoked")
             or (handle is not None and bool(handle.metadata.get("backend_cancel_invoked")))
         )
+        slot_metadata_source = (
+            session_state.metadata
+            if session_state is not None
+            else handle.metadata if handle is not None else {}
+        )
+        for key in ("slot_id", "incarnation_id", "slot_lease_id", "incarnation_status"):
+            value = _optional_string(slot_metadata_source.get(key))
+            if value is not None:
+                metadata[key] = value
+        if session_state is not None:
+            metadata["worker_session_id"] = session_state.session_id
+            metadata["last_worker_session_id"] = session_state.session_id
+            if session_state.persist_final_session and record.status == WorkerStatus.COMPLETED:
+                metadata["bound_worker_session_id"] = session_state.session_id
+                metadata["current_worker_session_id"] = session_state.session_id
+            else:
+                metadata["bound_worker_session_id"] = None
+                metadata["current_worker_session_id"] = None
         session: WorkerSession | None = None
         active_handle = handle or record.handle
         if session_state is not None and active_handle is not None:
@@ -2107,10 +2221,241 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                 "metadata": dict(escalation.metadata),
             }
         record.metadata = metadata
+        if provider_routing is not None and provider_routes:
+            await self._persist_provider_route_health(
+                assignment=assignment,
+                policy=policy,
+                provider_routes=provider_routes,
+                provider_routing=provider_routing,
+                attempts=attempts,
+                record=record,
+            )
         record = self._apply_failure_attribution(record=record, handle=active_handle)
         record.session = session
         await self.store.save_worker_record(record)
         return record
+
+    async def _persist_provider_route_health(
+        self,
+        *,
+        assignment: WorkerAssignment,
+        policy: WorkerExecutionPolicy,
+        provider_routes: tuple[WorkerProviderRoute, ...],
+        provider_routing: dict[str, object],
+        attempts: list[dict[str, object]],
+        record: WorkerRecord,
+    ) -> None:
+        if not provider_routes or not provider_routing:
+            return
+        raw_history = provider_routing.get("route_history")
+        route_history = raw_history if isinstance(raw_history, list) else []
+        history_map: dict[str, dict[str, object]] = {}
+        for entry in route_history:
+            route_id = _optional_string(entry.get("route_id"))
+            if route_id:
+                history_map[route_id] = entry
+        selected_route_id = _optional_string(provider_routing.get("selected_route"))
+        current_time = datetime.now(UTC)
+        updated_at = current_time.isoformat()
+        base_metadata = self._provider_route_health_metadata(
+            assignment=assignment,
+            record=record,
+        )
+        for route in provider_routes:
+            route_id = self._provider_route_id_value(route)
+            if not route_id:
+                continue
+            route_key = self._provider_route_key(role=assignment.role, route_id=route_id)
+            observed_failure_count = self._provider_route_failure_count(attempts, route_id)
+            entry = history_map.get(route_id)
+            selected_and_completed = (
+                bool(selected_route_id)
+                and selected_route_id == route_id
+                and record.status == WorkerStatus.COMPLETED
+            )
+            if entry is None and observed_failure_count <= 0 and not selected_and_completed:
+                continue
+            existing = await self.store.get_provider_route_health(route_key)
+            status = ProviderRouteStatus.HEALTHY
+            consecutive_failures = 0
+            cooldown_expires_at: str | None = None
+            last_failure_class: SlotFailureClass | None = None
+            if entry is not None:
+                outcome = entry.get("outcome")
+                if outcome == "provider_exhausted":
+                    status = ProviderRouteStatus.QUARANTINED
+                    base_failures = 0
+                    if (
+                        existing is not None
+                        and existing.status != ProviderRouteStatus.HEALTHY
+                    ):
+                        base_failures = max(existing.consecutive_failures, 0)
+                    consecutive_failures = base_failures + max(
+                        self._coerce_int(entry.get("attempt_count"), default=observed_failure_count),
+                        observed_failure_count,
+                        1,
+                    )
+                    last_failure_class = SlotFailureClass.EXTERNAL_DEGRADED
+                    cooldown_seconds = self._provider_route_cooldown_seconds(
+                        route=route,
+                        policy=policy,
+                        attempt_count=entry.get("attempt_count"),
+                    )
+                    cooldown_expires_at = self._cooldown_expires_at(
+                        now=current_time,
+                        seconds=cooldown_seconds,
+                    )
+                elif outcome == "attempts_exhausted":
+                    status = ProviderRouteStatus.DEGRADED_PROVIDER
+                    consecutive_failures = self._coerce_int(entry.get("attempt_count"))
+            else:
+                if observed_failure_count > 0:
+                    status = ProviderRouteStatus.WAITING_PROVIDER
+                    base_failures = 0
+                    if (
+                        existing is not None
+                        and existing.status != ProviderRouteStatus.HEALTHY
+                    ):
+                        base_failures = max(existing.consecutive_failures, 0)
+                    consecutive_failures = base_failures + observed_failure_count
+                    last_failure_class = SlotFailureClass.EXTERNAL_DEGRADED
+                    cooldown_seconds = self._provider_route_cooldown_seconds(
+                        route=route,
+                        policy=policy,
+                        attempt_count=observed_failure_count,
+                    )
+                    cooldown_expires_at = self._cooldown_expires_at(
+                        now=current_time,
+                        seconds=cooldown_seconds,
+                    )
+            preferred = selected_and_completed
+            metadata = dict(base_metadata)
+            metadata.setdefault("provider_route_id", route_id)
+            provider_name = _optional_string(route.metadata.get("provider_name"))
+            if provider_name is not None:
+                metadata["provider_name"] = provider_name
+            if entry is not None:
+                outcome = _optional_string(entry.get("outcome"))
+                if outcome is not None:
+                    metadata["last_outcome"] = outcome
+                metadata["observed_attempt_count"] = self._coerce_int(
+                    entry.get("attempt_count"),
+                    default=observed_failure_count,
+                )
+            elif observed_failure_count > 0:
+                metadata["observed_attempt_count"] = observed_failure_count
+            metadata["selected_route"] = preferred
+            route_health = ProviderRouteHealth(
+                route_key=route_key,
+                role=assignment.role,
+                backend=route.backend,
+                route_fingerprint=f"{assignment.role}:{route.backend}:{route_id}",
+                status=status,
+                health_score=self._provider_route_health_score(status=status),
+                consecutive_failures=consecutive_failures,
+                last_failure_class=last_failure_class,
+                cooldown_expires_at=cooldown_expires_at,
+                preferred=preferred,
+                updated_at=updated_at,
+                metadata=metadata,
+            )
+            await self.store.save_provider_route_health(route_health)
+
+    def _provider_route_health_metadata(
+        self,
+        *,
+        assignment: WorkerAssignment,
+        record: WorkerRecord,
+    ) -> dict[str, object]:
+        metadata = dict(assignment.metadata)
+        work_session_id = _optional_string(metadata.get("work_session_id"))
+        if work_session_id is None:
+            work_session_id = _optional_string(record.metadata.get("work_session_id"))
+        if work_session_id is not None:
+            metadata["work_session_id"] = work_session_id
+        else:
+            metadata.pop("work_session_id", None)
+        objective_id = _optional_string(assignment.objective_id) or _optional_string(
+            metadata.get("objective_id")
+        ) or _optional_string(record.metadata.get("objective_id"))
+        if objective_id is not None:
+            metadata["objective_id"] = objective_id
+        else:
+            metadata.pop("objective_id", None)
+        return metadata
+
+    def _provider_route_key(self, *, role: str | None, route_id: str) -> str:
+        role_value = _optional_string(role) or "role"
+        return f"{role_value}:{route_id}"
+
+    def _provider_route_id_value(self, route: WorkerProviderRoute) -> str:
+        return (
+            _optional_string(route.route_id)
+            or _optional_string(route.backend)
+            or "route"
+        )
+
+    def _coerce_int(self, value: object | None, default: int = 0) -> int:
+        try:
+            return int(value) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _provider_route_cooldown_seconds(
+        self,
+        *,
+        route: WorkerProviderRoute,
+        policy: WorkerExecutionPolicy,
+        attempt_count: object | None,
+    ) -> float:
+        if route.backoff_seconds is not None:
+            return max(float(route.backoff_seconds), 0.0)
+        initial = policy.provider_unavailable_backoff_initial_seconds
+        if initial <= 0:
+            return 0.0
+        exponent = max(self._coerce_int(attempt_count, default=1) - 1, 0)
+        seconds = initial * (policy.provider_unavailable_backoff_multiplier ** exponent)
+        max_seconds = policy.provider_unavailable_backoff_max_seconds
+        if max_seconds > 0:
+            seconds = min(seconds, max_seconds)
+        return max(seconds, 0.0)
+
+    def _cooldown_expires_at(self, *, now: datetime, seconds: float) -> str:
+        expires_at = now + timedelta(seconds=seconds)
+        return expires_at.isoformat()
+
+    def _provider_route_failure_count(
+        self,
+        attempts: list[dict[str, object]],
+        route_id: str,
+    ) -> int:
+        if not route_id:
+            return 0
+        count = 0
+        for attempt in attempts:
+            provider_route = attempt.get("provider_route")
+            if not isinstance(provider_route, Mapping):
+                continue
+            attempt_route = provider_route.get("route_id")
+            if attempt_route != route_id:
+                continue
+            failure_kind = attempt.get("failure_kind")
+            if failure_kind == WorkerFailureKind.PROVIDER_UNAVAILABLE.value:
+                count += 1
+        return count
+
+    def _provider_route_health_score(
+        self,
+        *,
+        status: ProviderRouteStatus,
+    ) -> float:
+        if status == ProviderRouteStatus.HEALTHY:
+            return 1.0
+        if status == ProviderRouteStatus.WAITING_PROVIDER:
+            return 0.5
+        if status == ProviderRouteStatus.DEGRADED_PROVIDER:
+            return 0.25
+        return 0.0
 
     async def recover_active_sessions(
         self,
@@ -2290,6 +2635,16 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
         return recovered_records
 
     async def start(self, handle: WorkerHandle, assignment: WorkerAssignment) -> None:
+        tracking_metadata = {
+            key: value
+            for key, value in {
+                "slot_id": assignment.metadata.get("slot_id"),
+                "incarnation_id": assignment.metadata.get("incarnation_id"),
+                "slot_lease_id": assignment.metadata.get("slot_lease_id"),
+                "incarnation_status": assignment.metadata.get("incarnation_status"),
+            }.items()
+            if value is not None
+        }
         launched = WorkerRecord(
             worker_id=handle.worker_id,
             assignment_id=assignment.assignment_id,
@@ -2298,7 +2653,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             status=WorkerStatus.LAUNCHED,
             handle=handle,
             started_at=_now(),
-            metadata={"task_id": assignment.task_id},
+            metadata={"task_id": assignment.task_id, **tracking_metadata},
         )
         await self.store.save_worker_record(launched)
 
@@ -2315,7 +2670,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
                 handle=handle,
                 started_at=launched.started_at,
                 last_heartbeat_at=_now(),
-                metadata={"task_id": assignment.task_id},
+                metadata=dict(launched.metadata),
             )
             await self.store.save_worker_record(running)
             try:
@@ -2389,7 +2744,7 @@ class DefaultWorkerSupervisor(WorkerSupervisor):
             handle=handle,
             started_at=launched.started_at,
             last_heartbeat_at=_now(),
-            metadata={"task_id": assignment.task_id},
+            metadata=dict(launched.metadata),
         )
         await self.store.save_worker_record(running)
 

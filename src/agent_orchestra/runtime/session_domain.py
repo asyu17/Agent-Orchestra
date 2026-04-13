@@ -13,6 +13,7 @@ from agent_orchestra.contracts.session_continuity import (
     SessionEvent,
     ShellAttachDecision,
     ShellAttachDecisionMode,
+    WorkSessionMessage,
 )
 from agent_orchestra.runtime.session_continuity import (
     SessionContinuityService,
@@ -89,6 +90,39 @@ class SessionDomainService:
             return None
         return ResidentWakeService(session_host=session_host)
 
+    async def _provider_route_health_views_for_work_session(
+        self,
+        *,
+        work_session_id: str,
+        objective_id: str | None,
+    ) -> tuple[dict[str, object], ...]:
+        routes = await self.store.list_provider_route_health()
+        matches: list[dict[str, object]] = []
+        for route in routes:
+            metadata = route.metadata if isinstance(route.metadata, Mapping) else {}
+            work_session_value = _optional_string(metadata.get("work_session_id"))
+            objective_value = _optional_string(metadata.get("objective_id"))
+            if work_session_value:
+                if work_session_value != work_session_id:
+                    continue
+            elif objective_id is not None:
+                if objective_value != objective_id:
+                    continue
+            else:
+                continue
+            matches.append(route.to_dict())
+        matches.sort(key=lambda item: str(item.get("route_key", "")))
+        return tuple(matches)
+
+    def _metadata_with_provider_route_health(
+        self,
+        base_metadata: Mapping[str, object] | None,
+        provider_route_health: tuple[dict[str, object], ...],
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = dict(base_metadata) if base_metadata is not None else {}
+        metadata["provider_route_health"] = [dict(item) for item in provider_route_health]
+        return metadata
+
     async def new_session(
         self,
         *,
@@ -122,7 +156,34 @@ class SessionDomainService:
             objective_id=snapshot.work_session.root_objective_id,
             resume_gate=snapshot.resume_gate,
         )
-        return replace(snapshot, resident_shell_views=resident_shell_views)
+        provider_route_health = await self._provider_route_health_views_for_work_session(
+            work_session_id=work_session_id,
+            objective_id=snapshot.work_session.root_objective_id,
+        )
+        return replace(
+            snapshot,
+            resident_shell_views=resident_shell_views,
+            provider_route_health=provider_route_health,
+        )
+
+    async def send_session_message(
+        self,
+        *,
+        work_session_id: str,
+        content: str,
+        role: str = "user",
+        scope_kind: str = "session",
+        scope_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> WorkSessionMessage:
+        return await self._service().append_session_message(
+            work_session_id=work_session_id,
+            content=content,
+            role=role,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            metadata=metadata,
+        )
 
     async def warm_resume(
         self,
@@ -151,29 +212,36 @@ class SessionDomainService:
 
     async def exact_wake(self, work_session_id: str) -> SessionResumeResult:
         decision = await self.resume_gate(work_session_id)
-        inspection = await self.inspect_session(work_session_id)
+        initial_inspection = await self.inspect_session(work_session_id)
+        provider_route_health = initial_inspection.provider_route_health
         if decision.mode != ResumeGateMode.EXACT_WAKE:
             return SessionResumeResult(
                 action="resume_gate",
                 decision=decision,
-                inspection=inspection,
-                metadata={"exact_wake_executed": False},
+                inspection=initial_inspection,
+                metadata=self._metadata_with_provider_route_health(
+                    {"exact_wake_executed": False},
+                    provider_route_health,
+                ),
             )
         if self.supervisor is None:
             return SessionResumeResult(
                 action="exact_wake_unavailable",
                 decision=decision,
-                inspection=inspection,
-                metadata={
-                    "exact_wake_executed": False,
-                    "reason": "worker_supervisor_required",
-                },
+                inspection=initial_inspection,
+                metadata=self._metadata_with_provider_route_health(
+                    {
+                        "exact_wake_executed": False,
+                        "reason": "worker_supervisor_required",
+                    },
+                    provider_route_health,
+                ),
             )
-        objective_id = inspection.work_session.root_objective_id
+        objective_id = initial_inspection.work_session.root_objective_id
         runtime_generation_id = (
             None
-            if inspection.current_runtime_generation is None
-            else inspection.current_runtime_generation.runtime_generation_id
+            if initial_inspection.current_runtime_generation is None
+            else initial_inspection.current_runtime_generation.runtime_generation_id
         )
 
         def _session_filter(session: WorkerSession) -> bool:
@@ -198,17 +266,36 @@ class SessionDomainService:
         recovered_records = await self.supervisor.recover_active_sessions(
             session_filter=_session_filter,
         )
-        return SessionResumeResult(
-            action="exact_wake",
-            decision=decision,
-            inspection=await self.inspect_session(work_session_id),
-            recovered_records=tuple(recovered_records),
-            metadata={
+        final_inspection = await self.inspect_session(work_session_id)
+        metadata = self._metadata_with_provider_route_health(
+            {
                 "exact_wake_executed": True,
                 "recovered_count": len(recovered_records),
                 "objective_id": objective_id,
                 "runtime_generation_id": runtime_generation_id,
+                "slot_ids": sorted(
+                    {
+                        record.slot_id
+                        for record in recovered_records
+                        if record.slot_id is not None
+                    }
+                ),
+                "incarnation_ids": sorted(
+                    {
+                        record.incarnation_id
+                        for record in recovered_records
+                        if record.incarnation_id is not None
+                    }
+                ),
             },
+            final_inspection.provider_route_health,
+        )
+        return SessionResumeResult(
+            action="exact_wake",
+            decision=decision,
+            inspection=final_inspection,
+            recovered_records=tuple(recovered_records),
+            metadata=metadata,
         )
 
     async def _resident_shells_for_work_session(
@@ -322,6 +409,7 @@ class SessionDomainService:
         force_warm_resume: bool = False,
     ) -> SessionResumeResult:
         inspection = await self.inspect_session(work_session_id)
+        provider_route_health = inspection.provider_route_health
         _, attach_decision = await self._preferred_shell_attach_decision(
             work_session_id=work_session_id,
             objective_id=inspection.work_session.root_objective_id,
@@ -331,7 +419,10 @@ class SessionDomainService:
                 action="rejected",
                 decision=attach_decision,
                 inspection=inspection,
-                metadata=dict(attach_decision.metadata),
+                metadata=self._metadata_with_provider_route_health(
+                    dict(attach_decision.metadata),
+                    provider_route_health,
+                ),
             )
         if (
             attach_decision is not None
@@ -341,7 +432,10 @@ class SessionDomainService:
                 action="attached",
                 decision=attach_decision,
                 inspection=inspection,
-                metadata=dict(attach_decision.metadata),
+                metadata=self._metadata_with_provider_route_health(
+                    dict(attach_decision.metadata),
+                    provider_route_health,
+                ),
             )
         if (
             attach_decision is not None
@@ -356,24 +450,32 @@ class SessionDomainService:
             and decision.mode in {ResumeGateMode.EXACT_WAKE, ResumeGateMode.INSPECT_ONLY}
         ):
             continuity = await self.warm_resume(work_session_id=work_session_id)
+            refreshed_inspection = await self.inspect_session(work_session_id)
+            metadata_base = {
+                **(dict(attach_decision.metadata) if attach_decision is not None else {}),
+                "forced": force_warm_resume,
+            }
+            metadata = self._metadata_with_provider_route_health(
+                metadata_base,
+                refreshed_inspection.provider_route_health,
+            )
             return SessionResumeResult(
                 action="warm_resumed",
                 decision=attach_decision or decision,
-                inspection=await self.inspect_session(work_session_id),
+                inspection=refreshed_inspection,
                 continuity_state=continuity,
-                metadata={
-                    **(dict(attach_decision.metadata) if attach_decision is not None else {}),
-                    "forced": force_warm_resume,
-                },
+                metadata=metadata,
             )
         if decision.mode == ResumeGateMode.EXACT_WAKE:
             recovered = await self.exact_wake(work_session_id)
-            metadata = dict(recovered.metadata)
-            if attach_decision is not None:
-                metadata = {
-                    **dict(attach_decision.metadata),
-                    **metadata,
-                }
+            metadata_base = {
+                **(dict(attach_decision.metadata) if attach_decision is not None else {}),
+                **dict(recovered.metadata),
+            }
+            metadata = self._metadata_with_provider_route_health(
+                metadata_base,
+                recovered.inspection.provider_route_health,
+            )
             return SessionResumeResult(
                 action="recovered",
                 decision=attach_decision or recovered.decision,
@@ -382,14 +484,20 @@ class SessionDomainService:
                 recovered_records=recovered.recovered_records,
                 metadata=metadata,
             )
+        final_inspection = await self.inspect_session(work_session_id)
+        metadata_base = {
+            **(dict(attach_decision.metadata) if attach_decision is not None else {}),
+            "forced": force_warm_resume,
+        }
+        metadata = self._metadata_with_provider_route_health(
+            metadata_base,
+            final_inspection.provider_route_health,
+        )
         return SessionResumeResult(
             action=decision.mode.value,
             decision=attach_decision or decision,
-            inspection=await self.inspect_session(work_session_id),
-            metadata={
-                **(dict(attach_decision.metadata) if attach_decision is not None else {}),
-                "forced": force_warm_resume,
-            },
+            inspection=final_inspection,
+            metadata=metadata,
         )
 
     async def wake_session(
@@ -397,6 +505,7 @@ class SessionDomainService:
         work_session_id: str,
     ) -> SessionResumeResult:
         inspection = await self.inspect_session(work_session_id)
+        provider_route_health = inspection.provider_route_health
         shell, attach_decision = await self._preferred_shell_attach_decision(
             work_session_id=work_session_id,
             objective_id=inspection.work_session.root_objective_id,
@@ -406,7 +515,10 @@ class SessionDomainService:
                 action="rejected",
                 decision=attach_decision,
                 inspection=inspection,
-                metadata=dict(attach_decision.metadata),
+                metadata=self._metadata_with_provider_route_health(
+                    dict(attach_decision.metadata),
+                    provider_route_health,
+                ),
             )
         if (
             attach_decision is not None
@@ -416,7 +528,10 @@ class SessionDomainService:
                 action="attached",
                 decision=attach_decision,
                 inspection=inspection,
-                metadata=dict(attach_decision.metadata),
+                metadata=self._metadata_with_provider_route_health(
+                    dict(attach_decision.metadata),
+                    provider_route_health,
+                ),
             )
 
         if (
@@ -457,12 +572,16 @@ class SessionDomainService:
                     )
                     _ = refreshed_shell
                     decision_to_return = refreshed_attach_decision or attach_decision
-                    metadata = {
+                    metadata_base = {
                         **dict(decision_to_return.metadata),
                         "wake_requested_session_ids": list(
                             wake_result.requested_session_ids
                         ),
                     }
+                    metadata = self._metadata_with_provider_route_health(
+                        metadata_base,
+                        refreshed_inspection.provider_route_health,
+                    )
                     return SessionResumeResult(
                         action="woken",
                         decision=decision_to_return,
@@ -473,12 +592,14 @@ class SessionDomainService:
         decision = await self.resume_gate(work_session_id)
         if decision.mode == ResumeGateMode.EXACT_WAKE:
             recovered = await self.exact_wake(work_session_id)
-            metadata = dict(recovered.metadata)
-            if attach_decision is not None:
-                metadata = {
-                    **dict(attach_decision.metadata),
-                    **metadata,
-                }
+            metadata_base = {
+                **(dict(attach_decision.metadata) if attach_decision is not None else {}),
+                **dict(recovered.metadata),
+            }
+            metadata = self._metadata_with_provider_route_health(
+                metadata_base,
+                recovered.inspection.provider_route_health,
+            )
             return SessionResumeResult(
                 action="recovered",
                 decision=attach_decision or recovered.decision,
@@ -515,7 +636,10 @@ class SessionDomainService:
             action="rejected",
             decision=rejected_decision,
             inspection=inspection,
-            metadata=dict(rejected_decision.metadata),
+            metadata=self._metadata_with_provider_route_health(
+                dict(rejected_decision.metadata),
+                provider_route_health,
+            ),
         )
 
     async def apply_assignment_continuity(

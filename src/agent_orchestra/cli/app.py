@@ -4,12 +4,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from typing import Any
-
-from agent_orchestra.runtime.orchestrator import (
-    AgentOrchestra,
-    build_in_memory_orchestra,
-    build_postgres_orchestra,
-)
 from agent_orchestra.runtime.session_domain import SessionResumeResult
 
 
@@ -31,7 +25,7 @@ def _serialize(value: Any) -> Any:
 
 
 class CliApplication:
-    def __init__(self, *, orchestra: AgentOrchestra) -> None:
+    def __init__(self, *, orchestra: Any) -> None:
         self.orchestra = orchestra
         self.runtime = orchestra.group_runtime()
 
@@ -103,6 +97,28 @@ class CliApplication:
             },
         }
 
+    async def session_send(
+        self,
+        *,
+        work_session_id: str,
+        content: str,
+        role: str = "user",
+        scope_kind: str = "session",
+        scope_id: str | None = None,
+    ) -> dict[str, object]:
+        message = await self.runtime.send_session_message(
+            work_session_id=work_session_id,
+            content=content,
+            role=role,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+        )
+        return {
+            "command": "session.send",
+            "work_session_id": work_session_id,
+            "message": _serialize(message),
+        }
+
     async def session_attach(
         self,
         *,
@@ -141,14 +157,16 @@ def build_cli_application(
     schema: str = "agent_orchestra",
 ) -> CliApplication:
     normalized_backend = store_backend.strip().lower()
-    if normalized_backend == "in-memory":
-        orchestra = build_in_memory_orchestra()
-    elif normalized_backend == "postgres":
-        if dsn is None or not dsn.strip():
-            raise ValueError("`--dsn` is required when --store-backend=postgres.")
-        orchestra = build_postgres_orchestra(dsn=dsn, schema=schema)
-    else:
-        raise ValueError(f"Unsupported store backend: {store_backend}")
+    if normalized_backend == "postgres" and (dsn is None or not dsn.strip()):
+        raise ValueError("`--dsn` is required when --store-backend=postgres.")
+
+    from agent_orchestra.runtime.orchestrator import build_orchestra_for_store_backend
+
+    orchestra = build_orchestra_for_store_backend(
+        store_backend=normalized_backend,
+        dsn=dsn,
+        schema=schema,
+    )
     return CliApplication(orchestra=orchestra)
 
 

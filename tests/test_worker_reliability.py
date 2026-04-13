@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from agent_orchestra.bus.in_memory import InMemoryEventBus
+from agent_orchestra.contracts.daemon import ProviderRouteStatus
 from agent_orchestra.contracts.enums import EventKind
 from agent_orchestra.contracts.execution import (
     ResidentCoordinatorPhase,
@@ -1603,6 +1604,87 @@ class WorkerReliabilityRuntimeTest(IsolatedAsyncioTestCase):
         self.assertEqual(record.metadata["escalation"]["reason"], "provider_exhausted")
         self.assertTrue(record.metadata["provider_routing"]["exhausted"])
         self.assertEqual(record.metadata["provider_routing"]["route_history"][-1]["route_id"], "backup")
+
+    async def test_group_runtime_persists_provider_route_health_and_quarantines_exhausted_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            primary = _ScriptedBackend(
+                backend_name="primary",
+                root=root,
+                launch_steps=[
+                    {
+                        "status": "failed",
+                        "error_text": "provider overloaded",
+                        "raw_payload": {
+                            "failure_kind": "provider_unavailable",
+                            "provider_name": "primary",
+                        },
+                    },
+                    {
+                        "status": "failed",
+                        "error_text": "provider still overloaded",
+                        "raw_payload": {
+                            "failure_kind": "provider_unavailable",
+                            "provider_name": "primary",
+                        },
+                    },
+                ],
+            )
+            fallback = _ScriptedBackend(
+                backend_name="fallback",
+                root=root,
+                launch_steps=[
+                    {
+                        "status": "completed",
+                        "output_text": "fallback succeeded",
+                        "raw_payload": {
+                            "provider_name": "backup",
+                        },
+                    }
+                ],
+            )
+            store = InMemoryOrchestrationStore()
+            runtime = GroupRuntime(
+                store=store,
+                bus=InMemoryEventBus(),
+                launch_backends={"primary": primary, "fallback": fallback},
+                supervisor=DefaultWorkerSupervisor(
+                    store=store,
+                    launch_backends={"primary": primary, "fallback": fallback},
+                ),
+            )
+
+            record = await runtime.run_worker_assignment(
+                _assignment(
+                    backend="primary",
+                    metadata={"work_session_id": "worksession-provider-health"},
+                ),
+                policy=WorkerExecutionPolicy(
+                    max_attempts=2,
+                    allow_relaunch=True,
+                    escalate_after_attempts=True,
+                    provider_fallbacks=(
+                        WorkerProviderRoute(
+                            route_id="backup",
+                            backend="fallback",
+                            metadata={"provider_name": "backup"},
+                        ),
+                    ),
+                ),
+            )
+            routes = await store.list_provider_route_health(role="teammate")
+
+        self.assertEqual(record.status, WorkerStatus.COMPLETED)
+        self.assertEqual(len(routes), 2)
+        primary_route = next(route for route in routes if route.route_key == "teammate:primary")
+        fallback_route = next(route for route in routes if route.route_key == "teammate:backup")
+        self.assertEqual(primary_route.status, ProviderRouteStatus.QUARANTINED)
+        self.assertEqual(primary_route.consecutive_failures, 2)
+        self.assertIsNotNone(primary_route.cooldown_expires_at)
+        self.assertEqual(primary_route.metadata["work_session_id"], "worksession-provider-health")
+        self.assertEqual(fallback_route.status, ProviderRouteStatus.HEALTHY)
+        self.assertEqual(fallback_route.consecutive_failures, 0)
+        self.assertTrue(fallback_route.preferred)
 
 
 class BackendResumeSemanticsTest(IsolatedAsyncioTestCase):

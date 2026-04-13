@@ -750,6 +750,106 @@ class WorkerSupervisorProtocolTest(IsolatedAsyncioTestCase):
         self.assertEqual(record.status, WorkerStatus.COMPLETED)
         self.assertEqual(record.metadata.get("protocol_wait_mode"), "native")
 
+    async def test_supervisor_persists_slot_tracking_fields_on_worker_and_host_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = _ProtocolProgressBackend(
+                backend_name="scripted",
+                root=Path(tmpdir),
+                events=[
+                    {
+                        "after": 0.04,
+                        "kind": "append_protocol_event",
+                        "event": {
+                            "event_id": "evt-accept-slot-metadata",
+                            "assignment_id": "assign-slot-metadata",
+                            "worker_id": "worker-assign-slot-metadata",
+                            "status": "accepted",
+                            "phase": "accepted",
+                        },
+                    },
+                    {
+                        "after": 0.04,
+                        "kind": "write_final_report",
+                        "report": {
+                            "assignment_id": "assign-slot-metadata",
+                            "worker_id": "worker-assign-slot-metadata",
+                            "terminal_status": "completed",
+                            "summary": "done",
+                        },
+                    },
+                    {
+                        "after": 0.02,
+                        "kind": "write_result",
+                        "status": "completed",
+                        "output_text": "done",
+                        "raw_payload": {"backend": "scripted"},
+                    },
+                ],
+            )
+            store = _TrackingSessionStore()
+            session_host = _RecordingSessionHost()
+            runtime = GroupRuntime(
+                store=store,
+                bus=InMemoryEventBus(),
+                launch_backends={"scripted": backend},
+                supervisor=DefaultWorkerSupervisor(
+                    store=store,
+                    launch_backends={"scripted": backend},
+                    poll_interval_seconds=0.001,
+                    default_timeout_seconds=0.2,
+                    session_host=session_host,
+                ),
+            )
+
+            assignment = _protocol_assignment(
+                assignment_id="assign-slot-metadata",
+                metadata={
+                    **_protocol_metadata(),
+                    "supervisor_id": "supervisor-slot-metadata",
+                    "slot_id": "slot:team-runtime:teammate:1",
+                },
+            )
+            run_task = asyncio.create_task(
+                runtime.run_worker_assignment(
+                    assignment,
+                    policy=WorkerExecutionPolicy(
+                        idle_timeout_seconds=0.01,
+                        hard_timeout_seconds=0.3,
+                        keep_session_idle=False,
+                        allow_relaunch=False,
+                        escalate_after_attempts=False,
+                    ),
+                )
+            )
+            await asyncio.sleep(0.01)
+            persisted = await store.get_worker_session("scripted:teammate:worker-assign-slot-metadata")
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            self.assertEqual(persisted.slot_id, "slot:team-runtime:teammate:1")
+            self.assertEqual(
+                persisted.metadata.get("slot_id"),
+                "slot:team-runtime:teammate:1",
+            )
+            self.assertIsNotNone(persisted.incarnation_id)
+            self.assertEqual(persisted.slot_lease_id, persisted.supervisor_lease_id)
+            self.assertEqual(persisted.incarnation_status, "active")
+            host_session = await session_host.load_session("scripted:teammate:worker-assign-slot-metadata")
+            self.assertIsNotNone(host_session)
+            assert host_session is not None
+            self.assertEqual(
+                host_session.metadata.get("slot_id"),
+                "slot:team-runtime:teammate:1",
+            )
+            self.assertEqual(
+                host_session.current_binding.metadata.get("slot_id"),
+                "slot:team-runtime:teammate:1",
+            )
+            self.assertEqual(
+                host_session.current_binding.metadata.get("slot_lease_id"),
+                persisted.supervisor_lease_id,
+            )
+            await run_task
+
     async def test_supervisor_persists_active_session_into_slot_owned_resident_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             backend = _ProtocolProgressBackend(

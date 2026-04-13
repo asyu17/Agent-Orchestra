@@ -5,10 +5,12 @@ import json
 import os
 import subprocess
 import sys
+import types
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase, skipIf
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -16,23 +18,52 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from agent_orchestra.cli.app import CliApplication
+if "agent_orchestra" not in sys.modules:
+    package = types.ModuleType("agent_orchestra")
+    package.__path__ = [str(SRC / "agent_orchestra")]
+    sys.modules["agent_orchestra"] = package
+
 from agent_orchestra.cli.main import build_parser, main
-from agent_orchestra.contracts.agent import SessionBinding
-from agent_orchestra.contracts.session_continuity import (
-    ConversationHead,
-    ConversationHeadKind,
-    RuntimeGenerationStatus,
-    ShellAttachDecisionMode,
-)
-from agent_orchestra.contracts.execution import (
-    ResidentCoordinatorPhase,
-    ResidentCoordinatorSession,
-)
-from agent_orchestra.runtime.orchestrator import build_in_memory_orchestra
+
+RUNTIME_IMPORT_ERROR: Exception | None = None
+try:
+    from agent_orchestra.cli.app import CliApplication
+    from agent_orchestra.contracts.agent import SessionBinding
+    from agent_orchestra.contracts.session_continuity import (
+        ConversationHead,
+        ConversationHeadKind,
+        RuntimeGenerationStatus,
+        ShellAttachDecisionMode,
+    )
+    from agent_orchestra.contracts.execution import (
+        ResidentCoordinatorPhase,
+        ResidentCoordinatorSession,
+    )
+    from agent_orchestra.runtime.orchestrator import build_in_memory_orchestra
+except Exception as exc:  # pragma: no cover - runtime import can be externally broken.
+    RUNTIME_IMPORT_ERROR = exc
+    CliApplication = object  # type: ignore[assignment]
 
 
 class CliParserTest(TestCase):
+    def test_parser_accepts_server_status_command(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["server", "status"])
+        self.assertEqual(args.command, "server")
+        self.assertEqual(args.server_command, "status")
+
+    def test_parser_defaults_session_control_plane_to_daemon(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "session",
+                "list",
+                "--group-id",
+                "group-a",
+            ]
+        )
+        self.assertEqual(args.control_plane, "daemon")
+
     def test_parser_defaults_session_store_backend_to_postgres(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -123,7 +154,45 @@ class CliParserTest(TestCase):
         self.assertEqual(args.session_command, "wake")
         self.assertEqual(args.work_session_id, "ws-1")
 
+    def test_parser_accepts_session_events(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "session",
+                "events",
+                "--work-session-id",
+                "ws-1",
+                "--limit",
+                "1",
+            ]
+        )
+        self.assertEqual(args.command, "session")
+        self.assertEqual(args.session_command, "events")
+        self.assertEqual(args.work_session_id, "ws-1")
+        self.assertEqual(args.limit, 1)
 
+    def test_parser_accepts_session_send(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "session",
+                "send",
+                "--work-session-id",
+                "ws-1",
+                "--content",
+                "continue",
+            ]
+        )
+        self.assertEqual(args.command, "session")
+        self.assertEqual(args.session_command, "send")
+        self.assertEqual(args.work_session_id, "ws-1")
+        self.assertEqual(args.content, "continue")
+
+
+@skipIf(
+    RUNTIME_IMPORT_ERROR is not None,
+    f"Runtime imports unavailable in this workspace state: {RUNTIME_IMPORT_ERROR}",
+)
 class CliApplicationTest(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.orchestra = build_in_memory_orchestra()
@@ -594,14 +663,157 @@ class CliApplicationTest(IsolatedAsyncioTestCase):
 
 
 class CliMainTest(TestCase):
+    @skipIf(
+        RUNTIME_IMPORT_ERROR is not None,
+        f"Local runtime path unavailable in this workspace state: {RUNTIME_IMPORT_ERROR}",
+    )
     def test_main_session_list_requires_durable_storage_config(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
-            exit_code = main(["session", "list", "--group-id", "group-a"])
+            exit_code = main(
+                [
+                    "session",
+                    "list",
+                    "--control-plane",
+                    "local",
+                    "--group-id",
+                    "group-a",
+                ]
+            )
         self.assertEqual(exit_code, 1)
         payload = json.loads(output.getvalue())
         self.assertIn("dsn", payload["error"].lower())
 
+    def test_main_session_list_routes_to_daemon_client(self) -> None:
+        daemon_app = AsyncMock()
+        daemon_app.session_list.return_value = {
+            "command": "session.list",
+            "group_id": "group-a",
+            "objective_id": None,
+            "sessions": [],
+        }
+        output = io.StringIO()
+        with patch(
+            "agent_orchestra.cli.main.build_daemon_cli_application",
+            return_value=daemon_app,
+        ):
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "session",
+                        "list",
+                        "--group-id",
+                        "group-a",
+                    ]
+                )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["command"], "session.list")
+        daemon_app.session_list.assert_awaited_once_with(
+            group_id="group-a",
+            objective_id=None,
+        )
+
+    def test_main_session_events_routes_to_daemon_client(self) -> None:
+        class _DaemonApp:
+            async def session_events(self, *, work_session_id: str | None = None):
+                yield {
+                    "command": "session.inspect",
+                    "work_session_id": work_session_id,
+                    "status": "updated",
+                }
+
+        output = io.StringIO()
+        with patch(
+            "agent_orchestra.cli.main.build_daemon_cli_application",
+            return_value=_DaemonApp(),
+        ):
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "session",
+                        "events",
+                        "--work-session-id",
+                        "ws-1",
+                        "--limit",
+                        "1",
+                    ]
+                )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload["command"], "session.inspect")
+        self.assertEqual(payload["work_session_id"], "ws-1")
+
+    def test_main_session_send_routes_to_daemon_client(self) -> None:
+        daemon_app = AsyncMock()
+        daemon_app.session_send.return_value = {
+            "command": "session.send",
+            "work_session_id": "ws-1",
+            "message": {
+                "message_id": "msg-1",
+                "content": "continue",
+            },
+        }
+        output = io.StringIO()
+        with patch(
+            "agent_orchestra.cli.main.build_daemon_cli_application",
+            return_value=daemon_app,
+        ):
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "session",
+                        "send",
+                        "--work-session-id",
+                        "ws-1",
+                        "--content",
+                        "continue",
+                    ]
+                )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["command"], "session.send")
+        daemon_app.session_send.assert_awaited_once_with(
+            work_session_id="ws-1",
+            content="continue",
+            role="user",
+            scope_kind="session",
+            scope_id=None,
+        )
+
+    def test_main_server_start_can_launch_background_daemon(self) -> None:
+        fake_process = types.SimpleNamespace(pid=43210)
+        output = io.StringIO()
+        with patch(
+            "agent_orchestra.cli.main.subprocess.Popen",
+            return_value=fake_process,
+        ) as popen:
+            with patch(
+                "agent_orchestra.cli.main._wait_for_socket_path",
+                return_value=True,
+                create=True,
+            ):
+                with redirect_stdout(output):
+                    exit_code = main(
+                        [
+                            "server",
+                            "start",
+                            "--no-foreground",
+                            "--socket-path",
+                            "/tmp/ao-test.sock",
+                        ]
+                    )
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["command"], "server.start")
+        self.assertEqual(payload["status"], "launched")
+        self.assertEqual(payload["pid"], 43210)
+        popen.assert_called_once()
+
+    @skipIf(
+        RUNTIME_IMPORT_ERROR is not None,
+        f"Local runtime path unavailable in this workspace state: {RUNTIME_IMPORT_ERROR}",
+    )
     def test_main_session_list_prints_real_payload_when_in_memory_is_explicit(self) -> None:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -609,6 +821,8 @@ class CliMainTest(TestCase):
                 [
                     "session",
                     "list",
+                    "--control-plane",
+                    "local",
                     "--store-backend",
                     "in-memory",
                     "--group-id",

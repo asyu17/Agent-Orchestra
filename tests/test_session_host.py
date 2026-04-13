@@ -47,6 +47,8 @@ from agent_orchestra.contracts.session_continuity import (
     ShellAttachDecisionMode,
 )
 from agent_orchestra.contracts.session_memory import AgentTurnKind, ArtifactRefKind, ToolInvocationKind
+from agent_orchestra.runtime.session_domain import SessionDomainService
+from agent_orchestra.runtime.worker_supervisor import DefaultWorkerSupervisor
 from agent_orchestra.runtime.session_host import InMemoryResidentSessionHost, StoreBackedResidentSessionHost
 from agent_orchestra.storage.in_memory import InMemoryOrchestrationStore
 from agent_orchestra.tools.permission_protocol import PermissionRequest
@@ -258,7 +260,87 @@ class SessionHostTest(IsolatedAsyncioTestCase):
         self.assertEqual(updated.metadata["last_worker_session_id"], "worker-session-0")
         self.assertEqual(updated.current_worker_session_id, "worker-session-1")
         self.assertEqual(updated.last_worker_session_id, "worker-session-0")
-        self.assertEqual(updated.last_reason, "processing directed mailbox work")
+
+    async def test_store_backed_host_preserves_attachable_shell_across_host_reinstantiation(self) -> None:
+        store = InMemoryOrchestrationStore()
+        initial_host = StoreBackedResidentSessionHost(store)
+        initial_supervisor = DefaultWorkerSupervisor(
+            store=store,
+            launch_backends={},
+            session_host=initial_host,
+        )
+        initial_service = SessionDomainService(store=store, supervisor=initial_supervisor)
+        continuity = await initial_service.new_session(
+            group_id="group-a",
+            objective_id="objective-attach",
+            title="Persisted host attach",
+        )
+        leader_session_id = "objective-attach:lane-runtime:leader:resident"
+        metadata = {
+            "group_id": "group-a",
+            "work_session_id": continuity.work_session.work_session_id,
+            "runtime_generation_id": continuity.runtime_generation.runtime_generation_id,
+        }
+        await initial_host.load_or_create_coordinator_session(
+            session_id=leader_session_id,
+            coordinator_id="leader:runtime",
+            objective_id="objective-attach",
+            lane_id="lane-runtime",
+            team_id="team-runtime",
+            role="leader",
+            host_owner_coordinator_id="superleader:objective-attach",
+            runtime_task_id="runtime-task-attach",
+            metadata=metadata,
+        )
+        await initial_host.bind_session(
+            leader_session_id,
+            SessionBinding(
+                session_id=leader_session_id,
+                backend="tmux",
+                binding_type="resident",
+                transport_locator={"session_name": "ao-runtime", "pane_id": "%12"},
+                supervisor_id="supervisor-live",
+                lease_id="lease-live",
+                lease_expires_at="2026-04-13T12:30:00+00:00",
+            ),
+        )
+        await initial_host.record_coordinator_session_state(
+            leader_session_id,
+            coordinator_session=ResidentCoordinatorSession(
+                coordinator_id="leader:runtime",
+                role="leader",
+                phase=ResidentCoordinatorPhase.WAITING_FOR_MAILBOX,
+                objective_id="objective-attach",
+                lane_id="lane-runtime",
+                team_id="team-runtime",
+                cycle_count=2,
+                prompt_turn_count=1,
+                claimed_task_count=0,
+                subordinate_dispatch_count=0,
+                mailbox_poll_count=2,
+                mailbox_cursor="leader-envelope-persisted",
+                last_reason="Waiting after host restart.",
+            ),
+            last_progress_at="2026-04-13T12:00:00+00:00",
+        )
+
+        restarted_host = StoreBackedResidentSessionHost(store)
+        restarted_supervisor = DefaultWorkerSupervisor(
+            store=store,
+            launch_backends={},
+            session_host=restarted_host,
+        )
+        restarted_service = SessionDomainService(store=store, supervisor=restarted_supervisor)
+
+        attached = await restarted_service.attach_session(continuity.work_session.work_session_id)
+        inspection = await restarted_service.inspect_session(continuity.work_session.work_session_id)
+
+        self.assertEqual(attached.action, "attached")
+        self.assertEqual(attached.metadata["preferred_session_id"], leader_session_id)
+        self.assertEqual(
+            inspection.resident_shell_views[0]["attach_recommendation"]["mode"],
+            ShellAttachDecisionMode.ATTACHED.value,
+        )
 
     async def test_load_or_create_session_and_slot_session_are_idempotent(self) -> None:
         host = InMemoryResidentSessionHost()

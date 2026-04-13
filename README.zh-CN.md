@@ -3,7 +3,7 @@
 [English](README.md)
 
 <p align="center">
-  <img src="assets/agent-orchestra-mascot-4x.png" alt="Agent-Orchestra mascot" width="180" />
+  <img src="assets/agent-orchestra-mascot.png" alt="Agent-Orchestra mascot" width="180" />
 </p>
 
 > A usable alpha runtime for multi-team agent orchestration in Python.  

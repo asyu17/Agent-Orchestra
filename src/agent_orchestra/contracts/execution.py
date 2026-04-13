@@ -79,6 +79,18 @@ class WorkerHandle:
     transport_ref: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "role": self.role,
+            "backend": self.backend,
+            "run_id": self.run_id,
+            "process_id": self.process_id,
+            "session_name": self.session_name,
+            "transport_ref": self.transport_ref,
+            "metadata": _json_safe(dict(self.metadata)),
+        }
+
 
 class WorkerTransportClass(str, Enum):
     FULL_RESIDENT_TRANSPORT = "full_resident_transport"
@@ -436,6 +448,10 @@ class WorkerSession:
     last_response_id: str | None = None
     reactivation_count: int = 0
     handle_snapshot: dict[str, Any] = field(default_factory=dict)
+    slot_id: str | None = None
+    incarnation_id: str | None = None
+    slot_lease_id: str | None = None
+    incarnation_status: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -449,6 +465,26 @@ class WorkerSession:
             self.transport_locator = WorkerTransportLocator.from_dict(payload)
         if self.transport_locator is not None and not self.handle_snapshot:
             self.handle_snapshot = self.transport_locator.to_dict()
+        if self.slot_id is None and isinstance(self.metadata.get("slot_id"), str):
+            self.slot_id = str(self.metadata.get("slot_id"))
+        if self.incarnation_id is None and isinstance(self.metadata.get("incarnation_id"), str):
+            self.incarnation_id = str(self.metadata.get("incarnation_id"))
+        if self.slot_lease_id is None and isinstance(self.metadata.get("slot_lease_id"), str):
+            self.slot_lease_id = str(self.metadata.get("slot_lease_id"))
+        if self.slot_lease_id is None and self.supervisor_lease_id is not None:
+            self.slot_lease_id = self.supervisor_lease_id
+        if self.incarnation_status is None and isinstance(
+            self.metadata.get("incarnation_status"), str
+        ):
+            self.incarnation_status = str(self.metadata.get("incarnation_status"))
+        if self.slot_id is not None:
+            self.metadata.setdefault("slot_id", self.slot_id)
+        if self.incarnation_id is not None:
+            self.metadata.setdefault("incarnation_id", self.incarnation_id)
+        if self.slot_lease_id is not None:
+            self.metadata.setdefault("slot_lease_id", self.slot_lease_id)
+        if self.incarnation_status is not None:
+            self.metadata.setdefault("incarnation_status", self.incarnation_status)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -475,6 +511,10 @@ class WorkerSession:
             "last_response_id": self.last_response_id,
             "reactivation_count": self.reactivation_count,
             "handle_snapshot": _json_safe(dict(self.handle_snapshot)),
+            "slot_id": self.slot_id,
+            "incarnation_id": self.incarnation_id,
+            "slot_lease_id": self.slot_lease_id,
+            "incarnation_status": self.incarnation_status,
             "metadata": _json_safe(dict(self.metadata)),
         }
 
@@ -534,6 +574,18 @@ class WorkerSession:
             ),
             reactivation_count=int(payload.get("reactivation_count", 0)),
             handle_snapshot=handle_snapshot,
+            slot_id=str(payload["slot_id"]) if payload.get("slot_id") is not None else None,
+            incarnation_id=(
+                str(payload["incarnation_id"]) if payload.get("incarnation_id") is not None else None
+            ),
+            slot_lease_id=(
+                str(payload["slot_lease_id"]) if payload.get("slot_lease_id") is not None else None
+            ),
+            incarnation_status=(
+                str(payload["incarnation_status"])
+                if payload.get("incarnation_status") is not None
+                else None
+            ),
             metadata=dict(payload.get("metadata", {})),
         )
 
@@ -586,6 +638,80 @@ class WorkerRecord:
     usage: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     session: WorkerSession | None = None
+    slot_id: str | None = None
+    incarnation_id: str | None = None
+    slot_lease_id: str | None = None
+    incarnation_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.slot_id is None and isinstance(self.metadata.get("slot_id"), str):
+            self.slot_id = str(self.metadata.get("slot_id"))
+        if self.incarnation_id is None and isinstance(self.metadata.get("incarnation_id"), str):
+            self.incarnation_id = str(self.metadata.get("incarnation_id"))
+        if self.slot_lease_id is None and isinstance(self.metadata.get("slot_lease_id"), str):
+            self.slot_lease_id = str(self.metadata.get("slot_lease_id"))
+        if self.incarnation_status is None and isinstance(
+            self.metadata.get("incarnation_status"), str
+        ):
+            self.incarnation_status = str(self.metadata.get("incarnation_status"))
+        if self.handle is not None:
+            handle_metadata = self.handle.metadata
+            if self.slot_id is None and isinstance(handle_metadata.get("slot_id"), str):
+                self.slot_id = str(handle_metadata.get("slot_id"))
+            if self.incarnation_id is None and isinstance(
+                handle_metadata.get("incarnation_id"), str
+            ):
+                self.incarnation_id = str(handle_metadata.get("incarnation_id"))
+            if self.slot_lease_id is None and isinstance(
+                handle_metadata.get("slot_lease_id"), str
+            ):
+                self.slot_lease_id = str(handle_metadata.get("slot_lease_id"))
+            if self.incarnation_status is None and isinstance(
+                handle_metadata.get("incarnation_status"), str
+            ):
+                self.incarnation_status = str(handle_metadata.get("incarnation_status"))
+        if self.session is not None:
+            if self.slot_id is None:
+                self.slot_id = self.session.slot_id
+            if self.incarnation_id is None:
+                self.incarnation_id = self.session.incarnation_id
+            if self.slot_lease_id is None:
+                self.slot_lease_id = self.session.slot_lease_id
+            if self.incarnation_status is None:
+                self.incarnation_status = self.session.incarnation_status
+        if self.slot_lease_id is None and self.session is not None:
+            self.slot_lease_id = self.session.supervisor_lease_id
+        if self.slot_id is not None:
+            self.metadata.setdefault("slot_id", self.slot_id)
+        if self.incarnation_id is not None:
+            self.metadata.setdefault("incarnation_id", self.incarnation_id)
+        if self.slot_lease_id is not None:
+            self.metadata.setdefault("slot_lease_id", self.slot_lease_id)
+        if self.incarnation_status is not None:
+            self.metadata.setdefault("incarnation_status", self.incarnation_status)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "assignment_id": self.assignment_id,
+            "backend": self.backend,
+            "role": self.role,
+            "status": self.status.value,
+            "handle": None if self.handle is None else self.handle.to_dict(),
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "last_heartbeat_at": self.last_heartbeat_at,
+            "output_text": self.output_text,
+            "error_text": self.error_text,
+            "response_id": self.response_id,
+            "usage": _json_safe(dict(self.usage)),
+            "metadata": _json_safe(dict(self.metadata)),
+            "session": None if self.session is None else self.session.to_dict(),
+            "slot_id": self.slot_id,
+            "incarnation_id": self.incarnation_id,
+            "slot_lease_id": self.slot_lease_id,
+            "incarnation_status": self.incarnation_status,
+        }
 
 
 @dataclass(slots=True)

@@ -4,6 +4,8 @@
 
 截至 2026 年 4 月 11 日，`agent_orchestra` 已经把 `ACTIVE` mid-turn process reattach、durable supervisor session、reconnector reclaim，以及 Redis-backed protocol bus 这条控制面主线真正接上。当前真实状态不再只是 durable idle session v1，而是：`DefaultWorkerSupervisor` 会在进入 native wait 前持久化 `ACTIVE` session、在协议事件推进时续写 lease/cursor、在 lease 过期后通过 `recover_active_sessions(...)` 走 `reclaim -> backend.reattach(...) -> protocol wait -> finalize` 完成恢复；`protocol_bridge` 已提供 `ProtocolBus / InMemoryProtocolBus / RedisProtocolBus` 和 `protocol_bus_events_from_worker_record(...)`；`RedisEventBus` 已具备 stream-family protocol 路径；self-hosting bootstrap 也已经把 `durable-supervisor-sessions`、`reconnector`、`protocol-bus` 收紧成 evidence-gated completion，而不是只凭 `delivery_state == completed` 关闭 gap。`online-collaboration-runtime` 这条主线在本轮又前推了一段：leader mailbox helper 现在只处理 leader 自己的 inbox，teammate recipient 的 cursor/session truth 已完全下沉到 `TeammateWorkSurface + ResidentSessionHost`；`ResidentSessionHost` 也已经补上 `load_or_create_slot_session(...) / list_runnable_teammate_slot_sessions(...) / commit_mailbox_consume(...) / record_activation_intent(...) / record_wake_request(...) / record_resident_shell_approval(...)` 这组 host API；`TeammateWorkSurface.run(...)` 则改成通过 per-slot `TeammateOnlineLoop` 驱动 directed mailbox、task-surface claim、worker execution、idle/wake 和 host-owned activation profile。2026-04-09 又把这条主线上最后一个明显的 leader-owned teammate activation shell 压薄：`LeaderLoopSupervisor._ensure_or_step_teammates(...)` 现在只保留 host-facing `TeammateWorkSurface.ensure_or_step_sessions(...)` 调用，不再在 leader 侧 pre-prime teammate acquisition/execute，也不再把当前 turn 的 `backend / working_dir / role_profile` 作为 live path 的 surface activation context 注入；如果当前既没有 leader-seeded assignment，也没有 host/session 中已持久化的 runnable slot profile，teammate continuation 会显式 no-op，而不是创建 placeholder resident slot session。当前又进一步固定了一层 continuation truth：一旦 slot session 已持久化 activation profile，后续 bounded step 会继续使用 host profile，而不会让当前 surface fallback 覆盖 host metadata；纯 continuation 也不再追加新的 leader-sourced activation / wake metadata。2026-04-09 还把 worker/agent/coordinator continuation read 这一层也收口到 `ResidentSessionHost`：store-backed host 读取 session 时会把 persisted `AgentSession` 与同 id `WorkerSession` 重新投影成 host-owned continuation truth，`DefaultWorkerSupervisor` 的 active persist / reclaim / finalize host write path 也改成先产出 `WorkerSession` snapshot，再通过 host projection 回写 session；`GroupRuntime` authoritative session readback 则优先走 supervisor host，而不是直接信 raw persisted `AgentSession` payload。2026-04-11 这条 resident-shell 主线又继续补上了两层产品面 truth：attach/idle approval queue 现在是 canonical `ResidentTeamShell.metadata["approval_queue"]`，`build_shell_attach_view(...)` 会同时导出 raw queue 与 derived attach-state status；`GroupRuntime.attach_session(...) / wake_session(...)` 也会在 attach approval `pending/denied` 时直接返回 `rejected`，而不是继续掉进 `resume_gate` 或 `exact_wake`。与此同时，CLI `session wake` 已经以 honest semantics 落地：live resident binding 返回 `attached`，`exact_wake` reclaim path 返回 `recovered`，其余情况明确返回 `rejected`，不再假装 detached wake service 已经存在。判断：这意味着 reclaim/finalize/reattach 不再各自拼装 competing session truth；当前剩余 gap 已进一步缩到更广义的 single-owner ownership 收口、detached external wake loop，以及更生产化的 permission/provider/planner/storage hardening，而不是“read projection 还散落在 supervisor/runtime/store 各处”。2026-04-10 同日，这条 coordination 主线又继续收紧了一层：`CoordinationTransactionStoreCommit`、`GroupRuntime.commit_directed_task_receipt(...) / commit_teammate_result(...) / commit_authority_request(...)`，以及 `StoreBackedResidentSessionHost.commit_mailbox_consume(...)` 现在都会把 `WorkerSession` snapshot 一起推进 coordination commit；PostgreSQL 会把它与 task/blackboard/delivery/cursor/agent-session/outbox 同事务提交，而不支持这条扩展事务面的 store 则会立即补一条 `save_worker_session(...)` fallback。判断：这条收口已经关闭了“result/authority/readback 仍被 stale ACTIVE worker session 拉回旧 continuation truth”与“mailbox consume 已提交但 worker session cursor 仍停在旧 envelope”这两类直接偏斜窗口，当前 residual gap 更集中在 broader single-owner ownership，而不是 first-cut coordination family 本身仍缺 `WorkerSession` write path。2026-04-09 还补上了一条 codex transient failure 收口：`codex_cli_backend` 现在会把 `chatgpt authentication required to sync remote plugins`、`plugins/featured`、`403 Forbidden`、`stream disconnected - retrying sampling request` 这类暂时性 provider/network/plugin-sync 失败显式归类成 `provider_unavailable`；`DefaultWorkerSupervisor` 也会在 `provider_unavailable` 时对同一路由做有限次自动重试，不再要求 `allow_relaunch=True` 才能重发；2026-04-10 则又把这条线继续推进成 provider-unavailable 专属指数退避：`WorkerExecutionPolicy` 与 `WorkerRoleProfile` 现在都会显式携带 `provider_unavailable_backoff_initial_seconds / multiplier / max_seconds`，而 `codex_cli` 默认 profile 已固定成 `15.0 / 2.0 / 120.0`。因此当前 `provider_unavailable` 已不再只复用统一的 `fallback_backoff_seconds = 2.0`，普通失败仍沿用现有 generic backoff，只有 provider/plugin-sync/network 瞬时失败才进入更长的指数退避，从而减少 self-hosting live run 因插件同步、403、短时网络波动而过快重打同一路由的概率。与此同时，team 级这轮新增的 3 条裁决也已经完成了协议切换：正式预算导出已经去掉 `max_concurrency`、self-hosting 默认 team 上限已提升到 `max_teammates = 20`，而且旧 `max_concurrency` 输入现在会被显式拒绝；leader 指令与 ingest 主链已经升级到 `sequential_slices / parallel_slices`，旧 `teammate_tasks` 协议也已停止接受；resident teammate slot 的执行上限不再由 `max_concurrency` 控制，而是由被激活的 slot 数和 `max_teammates` 决定。本轮还新增落地了一条 planning 主线：multi-leader `draft -> all-to-all peer review -> superleader global review -> revision -> activation` 已进入默认主路径。具体来说，`planning_review.py`、store CRUD、`GroupRuntime` planning-review APIs、`SuperLeaderRuntime` 的 pre-activation planning round、`planning_review_protocol.py`，以及 leader seeded activation 都已接上；现在又进一步把这条线接到了 self-hosting 主链：bootstrap gap inventory 仍能识别 `multi-leader-planning-review` 作为 targeted validation 项，但 superleader/self-hosting 已不再保留“默认关闭 planning-review”的旧路径，instruction packet 会导出 `planning_review_status`，而 `ActivationGateDecision` 也不再只是 store first-cut 对象，而是会由 runtime 真实发布、持久化，并同步写进 objective live metadata 的 `planning_review.activation_gate` 与顶层 `activation_gate`。再加上这轮原本列为 gap 的 4 个点也都已经进入主线 first-cut：`GroupRuntime.commit_directed_task_receipt(...) / commit_teammate_result(...)` 已把 `task claim / blackboard / result / lane delivery snapshot` 收口成 runtime-owned coordination surface；`task.receipt` 已在 directed claim materialization 时真实发出；`AgentSession` 与 worker session 的 reconnect truth 已有显式字段和 host 读口；`SuperLeaderRuntime` 也不再直接把 ready lane 变成 `leader_loop.run(...)` task，而是通过 `LeaderLoopSupervisor.ensure_or_step_session(...)` 先建立/推进 host-owned leader session，再把 lane session graph 和 `active_lane_session_ids` 作为协调真相导出。2026-04-09 还进一步把 superleader resident live view 从“lane delivery snapshot + host session graph + objective shared digest”推进成“lane digest/mailbox coordination metadata + host projection live input”：`GroupRuntime.read_resident_lane_live_views(...)` 现在会把 lane delivery metadata 里的 `message_runtime.pending_shared_digest_count`、`shared_digest_envelope_ids`、以及 mailbox follow-up 元数据一并 join 成 per-lane live input，`SuperLeaderRuntime` 也会让 host-owned `WAITING_FOR_MAILBOX` leader session 覆盖 stale `PENDING` lane delivery snapshot，避免 resident lane 因旧快照被误判为 ready to relaunch；当 objective subscription digests 暂时为空、但 lane delivery metadata 仍显示 digest/mailbox pressure 时，上层 cycle 也会继续进入 `WAITING_FOR_MAILBOX`，而不是过早掉进 dead-end dependency finalize。2026-04-11 这层 superleader live view 又继续 lift 到 attach-first resident shell 读模型：lane-level live input 现在还会导出 `lane_shell_statuses / lane_attach_modes / lane_attach_targets`，并把每条 lane 的 `resident_team_shell` 与 `shell_attach` payload 明确带到 superleader resident live view，因此 leader-of-leaders 已经开始消费同一套 single-team attach-first truth，而不是额外造一个 superleader shell。objective metadata 的 `resident_live_view` 现在不只导出 lane/session 计数，还会导出 `lane_digest_counts / lane_mailbox_followup_turns / lane_live_inputs / objective_message_runtime / objective_coordination`；self-hosting bootstrap 也会把这层更强的 resident truth 透传成 `superleader_runtime_status`。2026-04-10 又把这层 shared read model 再向 task-surface governance 推了一步：`GroupRuntime.read_resident_lane_live_views(...)` 现在会附带 lane-level `task_surface_authority` snapshot，`resident_live_view` 会继续汇总 `task_surface_authority_lane_ids / lane_task_surface_authority_waiting_task_ids`，而 `build_leader_revision_context_bundle(...)` 也不再只导出 peer-review digest，它会自动补齐 `authority_notices / project_item_notices` 与结构化 metadata，从而让 planning consumer 明确看到 task surface 是 governed runtime state，而不是 generic editable task graph。2026-04-09 还补上了一条 teammate-owned permission-denial 修复：当 permission broker 拒绝 assignment 执行时，work surface 会先沿 teammate 主线 claim / prepare 当前 task，再把 `BLOCKED` 状态与 blocker 证据写回，而不会在新的 task-surface authority contract 下因为“尚未取得 owner truth”而把 status update 直接打成 `PermissionError`。2026-04-09 还补上了一条 self-hosting authority/knowledge scope 修复：首批 4 个在线协作 gap 现在已经是 bootstrap catalog 的正式条目，不再靠 slug fallback 命中；`SelfHostingGap` 的 gap metadata 会透传到 `LeaderTaskCard`，leader prompt 能直接看到 lane-level default knowledge scope，而 descendant team task 在 slice 未显式声明时会继承 lane-owned docs scope。这里还固定了一条新的边界：default `verification_commands` 继承当前只对这 4 个 first-batch gap 启用，不再无差别扩散到 `team-parallel-execution`、`leader-teammate-delegation-validation` 这类 validation lane，避免 fake validation teammate 被错误提升成“必须跑真实 gap-level 验证”的错误主语义。本轮又进一步完成了 execution guard 切换：guard 的硬边界现在不再是 repo 内 `owned_paths`，而是 `target_roots`；repo 内 `owned_paths` 偏移会记录成 `scope_drift` 而不是直接把 authoritative `WorkerRecord` 打成 `FAILED`；`.pytest_cache` 已并入 generated-artifact ignore；而 protocol-first verification adjudication 也已经改成“同一 required command 优先最后一条成功结果，否则取最后一条等价结果”，避免 fallback loop 再次被第一条失败尝试误判。2026-04-08 还补上了一条关键的 resident finalization 修复：当 superleader 遇到再也没有 ready lane、但仍保留 `pending_lane_ids` 的 dead-end dependency graph 时，现在会直接 stop+finalize，而不是无限停在 `WAITING_FOR_DEPENDENCIES`；并且 finalize 的 objective evaluation 也已从“只看 `lane_results`”改成“消费全量 lane state”，因此 self-hosting round 不会再因为部分 lane 永久 pending 而丢失最终 instruction/summary artifact。authority 这条线也已经完成本阶段收口：`WorkerFinalReport` 可以携带结构化 `authority_request`，leader/superleader/teammate 共用 `AuthorityPolicy` 与 shared `authority_reactor.py`，`commit_authority_request(...)` 与 `commit_authority_decision(...)` 使用 public `CoordinationOutboxRecord` 并在 PostgreSQL `coordination_outbox` 中与 task/blackboard/delivery/session 同事务提交，`ResidentSessionHost` 会写出 authority relay / wake / closure truth，self-hosting 则改为消费结构化 `authority_completion` 而不是 summary-level heuristics。当前真正还没完成的，已经收缩到更深层的 host-owned resident hierarchy、`WorkerSession / AgentSession / ResidentCoordinatorSession` 的 broader single-owner write boundary、bootstrap/self-hosting evidence gate 在 runtime truth 稳定后的后置改写，以及 circle/subscription overlay 与 sticky provider / planner feedback / PostgreSQL hardening 这些后续主线。
 
+补充：截至 2026 年 4 月 12 日，这条主线又进一步进入 resident daemon backend first-cut。仓库里现在已经有本地常驻 `DaemonServer` / `DaemonClient`、`server start --no-foreground`、`session events`、`session send`、durable `AgentSlot / AgentIncarnation / SlotHealthEvent / SessionAttachment / ProviderRouteHealth`、`SlotManager / SlotSupervisor`，以及 daemon-owned slot materialization / terminal-record supervision loop。与此同时，`WorkerSession / WorkerRecord` 已有显式 `slot_id / incarnation_id / slot_lease_id / incarnation_status` 字段，`DefaultWorkerSupervisor` 会在 active persist、snapshot、finalize 和 host projection 中保留这些字段，因此 resident daemon、runtime supervisor、session host 与 durable store 已开始讲同一套 slot/incarnation/fencing 语言，而不是继续靠散落 metadata 与前台 CLI 进程去拼装 “谁还活着” 的真相。2026 年 4 月 13 日，这条 daemon 主线又补上了 3 个直接影响稳定性的 hardening：`DefaultWorkerSupervisor` 已在 assignment finalize 后真正持久化并更新 `ProviderRouteHealth`，`SessionDomainService.inspect_session(...) / attach_session(...) / wake_session(...) / exact_wake(...)` 已统一暴露 route health 读模型，而 `DaemonServer` 的 event hub 也已为 ephemeral daemon event 增加 replay buffer，从而关闭 `session.events` 订阅建立竞态丢失 `slot.restart_queued` 的窗口；同一轮里 worker-session durable truth 也开始稳定保留 `work_session_id / runtime_generation_id`，因此 abnormal replacement event 已能按 work session 正确过滤到客户端。判断：这仍然是 first-cut resident backend，不是 fully-hardened detached operating surface；但系统的主 operating shape 已经真正从“前台 bounded orchestration run”切向“常驻 daemon backend + thin CLI client + session attach/send/events + slot/incarnation supervision”，而 provider route memory / restart-event delivery 这两条直接影响“看起来经常断”的缺口已不再停留在设计层。
+
 2026-04-10 同时还补上了 session continuity first-cut：`WorkSession / RuntimeGeneration / ConversationHead` 已进入 contracts、store、`SessionContinuityService` 与 `GroupRuntime` 主线，leader/worker assignment 也能在兼容 contract 下复用 `previous_response_id` 并把 turn 结果回写成 `ConversationHead`。当前这条线又进一步推进到了第一版可用客户端：`SessionContinuityService` 已补上 `list_sessions(...) / inspect_session(...) / build_continuation_bundles(...)`，`GroupRuntime` 已补上 `new_session(...) / list_work_sessions(...) / inspect_session(...) / fork_session(...) / attach_session(...) / exact_wake(...) / wake_session(...)`，`DefaultWorkerSupervisor.recover_active_sessions(...)` 也支持 session-scoped filter；CLI 则已通过 `src/agent_orchestra/cli/app.py` + `src/agent_orchestra/cli/main.py` 暴露真实 store-backed `session list / inspect / new / attach / wake / fork`。判断：当前已不应再把 CLI 概括成纯 intent surface；更准确的状态是“session continuity client 已可用，公开恢复产品面已经收口成 attach-first 语义，而 `exact_wake` 仍是 runtime 内部的 best-effort reclaim/reattach 动作，不是额外保留的一层 legacy public recovery alias”。
 
 2026-04-11 夜间，这条 continuity 面又接上了 full-context session-memory first-cut：`src/agent_orchestra/contracts/session_memory.py` 已定义 `AgentTurnRecord / ToolInvocationRecord / ArtifactRef / SessionMemoryItem / HydrationBundle`；`ConversationHead` 也已补入 `checkpoint_id / prompt_contract_version / toolset_hash / contract_fingerprint` 这些更强的 invalidation metadata。与此同时，`src/agent_orchestra/storage/base.py`、`src/agent_orchestra/storage/in_memory.py`、`src/agent_orchestra/storage/postgres/models.py`、`src/agent_orchestra/storage/postgres/store.py` 已把 `agent_turn_records / tool_invocation_records / artifact_refs / session_memory_items` 接成正式 store-backed surface，而 `src/agent_orchestra/runtime/session_memory.py` 则负责从 worker result 产出 turn ledger、verification tool records、`final_report / protocol_events / protocol_state / generated_file` artifact refs，以及 handoff/open-loop semantic memory。`SessionInspectSnapshot` 现在会继续导出 `hydration_bundles`，`apply_assignment_continuity(...)` 在缺失 `last_response_id` 时也会把 hydration bundle 注入 assignment metadata，并把可读 hydration prompt 前置到 `input_text`。2026-04-12 这条线又补齐了 role-scoped capture：`leader_loop.py` 会记录 `leader_decision / mailbox_followup` 与对应 `mailbox_commit / mailbox_snapshot`；`teammate_work_surface.py` 会记录 directed/autonomous claim、authority transition 与 hydration-facing artifact；`superleader.py` 会记录 planning/finalize/live-view 决策并把 objective resident live view 落成 `delivery_snapshot`；`session_host.py` 则把 attach view / approval queue 接成 `leader_decision + hydration_input + protocol_tool`。同时 `SessionMemoryService.record_role_turn(...) / upsert_conversation_head(...)` 已成为非 worker role 的共享 capture helper，因此没有新 `response_id` 的 host/system turn 也能补齐 conversation head 与 hydration 输入面。判断：这意味着 continuity 层已经不再只会保存 thin `ContinuationBundle`，而是拥有覆盖 worker、leader、teammate、superleader 与 session-host 主路径的 degraded-resume surface；当前残留缺口已进一步收缩到 semantic-memory extraction hardening、retention/redaction/compaction 精化，以及 broader single-owner continuation cleanup。
@@ -184,6 +186,67 @@ covered 主线路径已经形成：
   - `uv run pytest -q`
 - 但当前 workspace 未附带可追溯的全量回归 artifact；如果要把当前全量回归状态写成 authority 结论，需要重新执行并保留结果，在未重跑前不固化精确通过数。
 
+### 3.8 2026-04-12 resident daemon backend first-cut 验证
+
+本轮新增并已通过 focused regression 的直接验证面包括：
+
+- `tests/test_daemon_contracts.py`
+- `tests/test_postgres_store.py`
+- `tests/test_daemon_server.py`
+- `tests/test_cli.py`
+- `tests/test_slot_supervisor.py`
+- `tests/test_worker_supervisor_protocol.py`
+- `tests/test_session_domain.py`
+
+本地已执行：
+
+```bash
+python3 -m unittest \
+  tests.test_daemon_contracts \
+  tests.test_postgres_store \
+  tests.test_daemon_server \
+  tests.test_cli \
+  tests.test_slot_supervisor \
+  tests.test_worker_supervisor_protocol \
+  tests.test_session_domain
+```
+
+结果：
+
+- `Ran 113 tests ... OK`
+
+2026-04-13 针对 resident daemon reliability hardening 又执行了更完整回归：
+
+```bash
+python3 -m unittest \
+  tests.test_worker_reliability \
+  tests.test_daemon_server \
+  tests.test_runtime \
+  tests.test_session_host \
+  tests.test_daemon_contracts \
+  tests.test_postgres_store \
+  tests.test_cli \
+  tests.test_slot_supervisor \
+  tests.test_worker_supervisor_protocol \
+  tests.test_session_domain -v
+```
+
+结果：
+
+- `Ran 233 tests ... OK`
+
+这轮新增直接证明的面包括：
+
+- `tests/test_worker_reliability.py`
+  - `ProviderRouteHealth` 已由 worker-supervisor finalization 真正持久化，exhausted route 会进入 quarantine/cooldown，最终成功路由会被标记为 preferred
+- `tests/test_daemon_server.py`
+  - real daemon `session.inspect` 与 `session.attach` 已显式暴露 `provider_route_health`
+- `tests/test_runtime.py`
+  - daemon 在 client 断开后仍能保留 live attachable session
+  - abnormal slot failure 后会发出 `slot.restart_queued` 并 materialize replacement incarnation
+- `tests/test_session_host.py`
+  - store-backed host 重建后仍能保留 attachable resident shell truth
+
 ## 4. 当前欠缺
 
 ### 4.1 `team-parallel-execution` 已进入当前主线
@@ -226,11 +289,17 @@ planner 仍以 deterministic template planning + bounded dynamic planning 为主
 
 ### 4.5 `sticky-provider-routing`
 
-当前只完成了 per-assignment fallback / backoff / exhaustion routing。还没有：
+当前已经不再只有 per-assignment fallback / backoff / exhaustion routing。系统现在还具备：
 
-- 跨轮 provider health memory
+- `ProviderRouteHealth` durable memory
+- route key 级别的 quarantine / cooldown / preferred route truth
+- `session.inspect` 与 attach/wake/read model 的 provider route health 暴露
+
+但真正完整的 sticky-provider-routing 仍未完成。还没有：
+
 - sticky route 选择
 - provider score/health 驱动的默认路由
+- 在 launch 前消费跨轮 route health 来主动避开坏路由
 
 ### 4.6 `online-collaboration-runtime` 仍未完成的部分
 

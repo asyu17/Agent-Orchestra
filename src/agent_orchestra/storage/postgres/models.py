@@ -385,6 +385,84 @@ def schema_statements(schema: str = "agent_orchestra") -> tuple[str, ...]:
         );
         """.strip(),
         f"""
+        CREATE TABLE IF NOT EXISTS {schema}.agent_slots (
+            slot_id TEXT PRIMARY KEY,
+            work_session_id TEXT NOT NULL REFERENCES {schema}.work_sessions(work_session_id) ON DELETE CASCADE,
+            resident_team_shell_id TEXT,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL,
+            desired_state TEXT NOT NULL,
+            preferred_backend TEXT,
+            preferred_transport_class TEXT,
+            current_incarnation_id TEXT,
+            current_lease_id TEXT,
+            restart_count BIGINT NOT NULL DEFAULT 0,
+            last_failure_class TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        );
+        """.strip(),
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.agent_incarnations (
+            incarnation_id TEXT PRIMARY KEY,
+            slot_id TEXT NOT NULL REFERENCES {schema}.agent_slots(slot_id) ON DELETE CASCADE,
+            work_session_id TEXT NOT NULL REFERENCES {schema}.work_sessions(work_session_id) ON DELETE CASCADE,
+            runtime_generation_id TEXT,
+            status TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            restart_generation BIGINT NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            terminal_failure_class TEXT,
+            payload JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        );
+        """.strip(),
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.slot_health_events (
+            event_id TEXT PRIMARY KEY,
+            slot_id TEXT NOT NULL REFERENCES {schema}.agent_slots(slot_id) ON DELETE CASCADE,
+            incarnation_id TEXT,
+            work_session_id TEXT NOT NULL REFERENCES {schema}.work_sessions(work_session_id) ON DELETE CASCADE,
+            event_kind TEXT NOT NULL,
+            failure_class TEXT,
+            observed_at TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        );
+        """.strip(),
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.session_attachments (
+            attachment_id TEXT PRIMARY KEY,
+            work_session_id TEXT NOT NULL REFERENCES {schema}.work_sessions(work_session_id) ON DELETE CASCADE,
+            resident_team_shell_id TEXT,
+            slot_id TEXT,
+            incarnation_id TEXT,
+            client_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attached_at TEXT NOT NULL,
+            detached_at TEXT,
+            last_event_id TEXT,
+            payload JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        );
+        """.strip(),
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.provider_route_health (
+            route_key TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            route_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            health_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+            consecutive_failures BIGINT NOT NULL DEFAULT 0,
+            last_failure_class TEXT,
+            cooldown_expires_at TEXT,
+            preferred BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        );
+        """.strip(),
+        f"""
         CREATE TABLE IF NOT EXISTS {schema}.protocol_bus_cursors (
             stream TEXT NOT NULL,
             consumer TEXT NOT NULL,

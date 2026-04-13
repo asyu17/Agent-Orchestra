@@ -160,6 +160,7 @@
 - `resident-daemon-backend-and-session-attach.md`
   - 固化为什么 AO 的长期正确形态不应继续是前台 bounded orchestration run，而应变成“常驻 daemon backend + thin CLI client + session attach + slot/incarnation supervision”
   - 明确 daemon 才是 live runtime owner、session 是用户主操作面、异常失败时被替换的是 incarnation 而不是 slot 身份，以及为什么这条线比单纯 watchdog patch 更完整
+  - 现已补入 first-cut 落地状态：后台 daemon start、`session events/send`、durable `AgentSlot / AgentIncarnation / SlotHealthEvent / SessionAttachment / ProviderRouteHealth`、daemon-owned slot materialization/supervision loop，以及 `WorkerSession / WorkerRecord` 的显式 slot tracking 字段
   - 适合作为“要把 AO 做成类似 codex/claude 的本地常驻后端，并用 session attach 交互”的直接入口
 - `resident-team-shell-and-attach-first.md`
   - 固化为什么在 continuity first-cut 之后，系统的下一目标不应继续围绕 `exact_wake` 做产品设计，而应把可 attach 的单 team 常驻 shell 提升成默认 operating surface

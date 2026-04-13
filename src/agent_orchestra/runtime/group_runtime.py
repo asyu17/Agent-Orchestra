@@ -664,6 +664,25 @@ class GroupRuntime:
     async def inspect_session(self, work_session_id: str) -> SessionInspectSnapshot:
         return await self._session_domain_service().inspect_session(work_session_id)
 
+    async def send_session_message(
+        self,
+        *,
+        work_session_id: str,
+        content: str,
+        role: str = "user",
+        scope_kind: str = "session",
+        scope_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ):
+        return await self._session_domain_service().send_session_message(
+            work_session_id=work_session_id,
+            content=content,
+            role=role,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            metadata=metadata,
+        )
+
     async def warm_resume(
         self,
         *,
